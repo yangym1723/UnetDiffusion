@@ -4,10 +4,10 @@ shape_meta: &shape_meta
   # acceptable types: rgb, low_dim
   obs:
     agentview_image:
-      shape: [3, 84, 84]
+      shape: [3, 480, 640]
       type: rgb
     robot0_eye_in_hand_image:
-      shape: [3, 84, 84]
+      shape: [3, 480, 640]
       type: rgb
     robot0_eef_pos:
       shape: [3]
