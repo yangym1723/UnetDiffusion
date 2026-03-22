@@ -18,6 +18,10 @@ past_action_visible: False
 keypoint_visible_rate: 1.0
 obs_as_global_cond: True
 
+task:
+  dataset:
+    return_action_history: ${policy.action_history_rnn.enabled}
+
 policy:
   _target_: diffusion_policy.policy.diffusion_unet_hybrid_image_policy.DiffusionUnetHybridImagePolicy
 
@@ -47,6 +51,16 @@ policy:
   cond_predict_scale: True
   obs_encoder_group_norm: True
   eval_fixed_crop: True
+  action_history_rnn:
+    enabled: True
+    rnn_type: gru
+    hidden_dim: 256
+    output_dim: 256
+    num_layers: 1
+    dropout: 0.0
+    use_cumulative_sum: True
+    output_mlp_dims: []
+    nonlinearity: tanh
 
   # scheduler.step params
   # predict_epsilon: True

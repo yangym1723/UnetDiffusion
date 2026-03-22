@@ -42,6 +42,7 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             abs_action=False,
             rotation_rep='rotation_6d', # ignored when abs_action=False
             use_legacy_normalizer=False,
+            return_action_history=False,
             use_cache=False,
             seed=42,
             val_ratio=0.0
@@ -132,6 +133,14 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         self.pad_before = pad_before
         self.pad_after = pad_after
         self.use_legacy_normalizer = use_legacy_normalizer
+        self.return_action_history = return_action_history
+        self.action_dim = shape_meta['action']['shape'][0]
+        self.episode_ends = replay_buffer.episode_ends[:].astype(np.int64)
+        self.episode_starts = np.concatenate([
+            np.zeros((1,), dtype=np.int64),
+            self.episode_ends[:-1]
+        ])
+        self.max_episode_length = int(np.max(self.episode_ends - self.episode_starts))
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
@@ -217,7 +226,37 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             'obs': dict_apply(obs_dict, torch.from_numpy),
             'action': torch.from_numpy(data['action'].astype(np.float32))
         }
+        if self.return_action_history:
+            action_history, action_history_mask, action_history_length = self._get_action_history(idx)
+            torch_data['action_history'] = torch.from_numpy(action_history)
+            torch_data['action_history_mask'] = torch.from_numpy(action_history_mask)
+            torch_data['action_history_length'] = torch.tensor(action_history_length, dtype=torch.long)
         return torch_data
+
+    def _get_action_history(self, idx: int):
+        buffer_start_idx, _, sample_start_idx, _ = self.sampler.indices[idx]
+        episode_idx = np.searchsorted(self.episode_ends, buffer_start_idx, side='right')
+        episode_start = int(self.episode_starts[episode_idx])
+        episode_end = int(self.episode_ends[episode_idx])
+
+        current_obs_offset = 0
+        if self.n_obs_steps is not None:
+            current_obs_offset = self.n_obs_steps - 1 - sample_start_idx
+        current_abs_idx = buffer_start_idx + current_obs_offset
+        current_abs_idx = max(current_abs_idx, episode_start)
+        current_abs_idx = min(current_abs_idx, episode_end)
+
+        action_history = self.replay_buffer['action'][episode_start:current_abs_idx].astype(np.float32)
+        action_history_length = action_history.shape[0]
+
+        padded_history = np.zeros(
+            (self.max_episode_length, self.action_dim),
+            dtype=np.float32)
+        history_mask = np.zeros((self.max_episode_length,), dtype=bool)
+        if action_history_length > 0:
+            padded_history[:action_history_length] = action_history
+            history_mask[:action_history_length] = True
+        return padded_history, history_mask, action_history_length
 
 
 def _convert_actions(raw_actions, abs_action, rotation_transformer):

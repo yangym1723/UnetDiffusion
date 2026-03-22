@@ -239,15 +239,16 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                     with torch.no_grad():
                         # sample trajectory from training set, and evaluate difference
                         batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
-                        obs_dict = batch['obs']
                         gt_action = batch['action']
-                        
-                        result = policy.predict_action(obs_dict)
+
+                        if hasattr(policy, 'predict_action_from_batch'):
+                            result = policy.predict_action_from_batch(batch)
+                        else:
+                            result = policy.predict_action(batch['obs'])
                         pred_action = result['action_pred']
                         mse = torch.nn.functional.mse_loss(pred_action, gt_action)
                         step_log['train_action_mse_error'] = mse.item()
                         del batch
-                        del obs_dict
                         del gt_action
                         del result
                         del pred_action
