@@ -63,6 +63,17 @@ def parse_args():
         action="store_true",
         help="Open an interactive viewer with keyboard controls.",
     )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default=None,
+        help="Optional matplotlib backend, for example QtAgg or TkAgg.",
+    )
+    parser.add_argument(
+        "--enable-toolbar",
+        action="store_true",
+        help="Enable the matplotlib toolbar in interactive mode.",
+    )
     return parser.parse_args()
 
 
@@ -362,17 +373,31 @@ def main():
     if not args.hdf5.exists():
         raise FileNotFoundError(args.hdf5)
 
-    if not args.interactive:
-        import matplotlib
+    import matplotlib
 
-        if not args.show:
-            matplotlib.use("Agg")
+    if args.backend is not None:
+        matplotlib.use(args.backend)
+    elif not args.interactive and not args.show:
+        matplotlib.use("Agg")
+
+    if args.interactive and not args.enable_toolbar:
+        matplotlib.rcParams["toolbar"] = "None"
+
     from matplotlib import pyplot as plt
 
-    if args.interactive:
-        run_interactive(args, plt)
-    else:
-        run_static(args, plt)
+    try:
+        if args.interactive:
+            run_interactive(args, plt)
+        else:
+            run_static(args, plt)
+    except Exception as exc:
+        if args.interactive:
+            backend_name = matplotlib.get_backend()
+            print(
+                f"Interactive viewer failed under backend {backend_name}: {exc}\n"
+                "Try running again with --backend QtAgg, or keep the default backend and let the script disable the toolbar."
+            )
+        raise
 
 
 if __name__ == "__main__":
