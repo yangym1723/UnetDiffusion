@@ -1,8 +1,28 @@
 import argparse
 from pathlib import Path
 
+import cv2
 import h5py
 import numpy as np
+
+
+ARROW_LEFT_CODES = {81, 2424832, 65361}
+ARROW_UP_CODES = {82, 2490368, 65362}
+ARROW_RIGHT_CODES = {83, 2555904, 65363}
+ARROW_DOWN_CODES = {84, 2621440, 65364}
+PAGE_UP_CODES = {2162688, 65365}
+PAGE_DOWN_CODES = {2228224, 65366}
+HOME_CODES = {2359296, 65360}
+END_CODES = {2293760, 65367}
+ESC_CODES = {27}
+
+
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+TEXT_COLOR = (240, 240, 240)
+TEXT_BG = (20, 20, 20)
+SEPARATOR_COLOR = (70, 70, 70)
+PANEL_BG = (18, 18, 18)
+WINDOW_NAME = "rgb_depth_inspector"
 
 
 def parse_args():
@@ -56,23 +76,12 @@ def parse_args():
     parser.add_argument(
         "--show",
         action="store_true",
-        help="Display the figure interactively after saving it in static mode.",
+        help="Display the composed image window in static mode.",
     )
     parser.add_argument(
         "--interactive",
         action="store_true",
-        help="Open an interactive viewer with keyboard controls.",
-    )
-    parser.add_argument(
-        "--backend",
-        type=str,
-        default=None,
-        help="Optional matplotlib backend, for example QtAgg or TkAgg.",
-    )
-    parser.add_argument(
-        "--enable-toolbar",
-        action="store_true",
-        help="Enable the matplotlib toolbar in interactive mode.",
+        help="Open an interactive OpenCV viewer with keyboard controls.",
     )
     return parser.parse_args()
 
@@ -116,21 +125,27 @@ def prepare_rgb_for_display(frame: np.ndarray) -> np.ndarray:
         frame = frame[..., :3]
 
     if frame.dtype == np.uint8:
-        return frame
-
-    frame = frame.astype(np.float32)
-    if frame.max() <= 1.0:
-        frame = np.clip(frame, 0.0, 1.0)
+        rgb = frame
     else:
-        frame = np.clip(frame / 255.0, 0.0, 1.0)
-    return frame
+        frame = frame.astype(np.float32)
+        if frame.max() <= 1.0:
+            frame = np.clip(frame, 0.0, 1.0)
+            rgb = np.round(frame * 255.0).astype(np.uint8)
+        else:
+            rgb = np.clip(frame, 0.0, 255.0).astype(np.uint8)
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
 
 def prepare_depth_for_display(frame: np.ndarray) -> np.ndarray:
     frame = normalize_hwc(frame)
     if frame.shape[-1] == 1:
-        return frame[..., 0]
-    return frame[..., :3].mean(axis=-1)
+        depth_gray = frame[..., 0]
+    else:
+        depth_gray = frame[..., 0]
+
+    if depth_gray.dtype != np.uint8:
+        depth_gray = np.clip(depth_gray, 0.0, 255.0).astype(np.uint8)
+    return cv2.cvtColor(depth_gray, cv2.COLOR_GRAY2BGR)
 
 
 def array_stats(array: np.ndarray):
@@ -157,10 +172,25 @@ def build_default_save_path(base_path: Path, demo_name: str, frame_index: int) -
     return base_path.parent / filename
 
 
+def put_text_lines(img: np.ndarray, lines, origin_x: int, origin_y: int, line_gap: int = 22):
+    y = origin_y
+    for line in lines:
+        cv2.putText(
+            img,
+            line,
+            (origin_x, y),
+            FONT,
+            0.55,
+            TEXT_COLOR,
+            1,
+            cv2.LINE_AA,
+        )
+        y += line_gap
+
+
 class RgbDepthInspector:
-    def __init__(self, args, plt):
+    def __init__(self, args):
         self.args = args
-        self.plt = plt
         self.file = h5py.File(args.hdf5, "r")
         self.data_group = self.file["data"]
         self.demo_names = sorted_demo_names(self.data_group)
@@ -169,22 +199,15 @@ class RgbDepthInspector:
         )
         self.demo_pos = self.demo_names.index(selected_demo_name)
         self.frame_index = args.frame_index
-        self.colorbar = None
-
-        self.fig, self.axes = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
-        self.fig.canvas.mpl_connect("key_press_event", self.on_key_press)
-        self.fig.canvas.mpl_connect("close_event", self.on_close)
-        self.fig.text(
-            0.5,
-            0.01,
-            "Left/Right: frame  Up/Down: demo  PageUp/PageDown: +/-10 frames  Home/End: first/last frame  s: save  h: help  q: quit",
-            ha="center",
-            fontsize=9,
-        )
 
     @property
     def demo_name(self):
         return self.demo_names[self.demo_pos]
+
+    def close(self):
+        if self.file is not None:
+            self.file.close()
+            self.file = None
 
     def get_obs_group(self):
         return self.data_group[self.demo_name]["obs"]
@@ -218,7 +241,7 @@ class RgbDepthInspector:
         self.clamp_frame_index()
         return rgb_dataset[self.frame_index], depth_dataset[self.frame_index]
 
-    def save_current_view(self):
+    def save_current_view(self, canvas: np.ndarray):
         if self.args.save_path is None:
             out_path = build_default_save_path(self.args.hdf5, self.demo_name, self.frame_index)
         else:
@@ -232,20 +255,23 @@ class RgbDepthInspector:
                     f"{self.demo_name}_frame_{self.frame_index:06d}_rgb_depth_check.png"
                 )
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        self.fig.savefig(out_path, dpi=150)
+        cv2.imwrite(str(out_path), canvas)
         print(f"Saved comparison image to: {out_path}")
 
     def print_help(self):
         print("Keyboard controls:")
-        print("  Left / Right : previous / next frame")
-        print("  PageUp / PageDown : jump -10 / +10 frames")
+        print("  Left / a : previous frame")
+        print("  Right / d : next frame")
+        print("  PageUp : -10 frames")
+        print("  PageDown : +10 frames")
         print("  Home / End : first / last frame in current demo")
-        print("  Up / Down : previous / next demo")
+        print("  Up / w : previous demo")
+        print("  Down / n : next demo")
         print("  s : save the current comparison image")
         print("  h : print this help")
         print("  q or Esc : quit")
 
-    def refresh(self, print_current_stats=True):
+    def render_current_view(self, print_current_stats=True):
         rgb_frame_raw, depth_frame_raw = self.get_current_frames()
         rgb_stats = array_stats(rgb_frame_raw)
         depth_stats = array_stats(depth_frame_raw)
@@ -263,109 +289,145 @@ class RgbDepthInspector:
                     )
                     print(f"depth_rgb_channels_identical={identical_channels}")
 
-        rgb_display = prepare_rgb_for_display(rgb_frame_raw)
-        depth_display = prepare_depth_for_display(depth_frame_raw)
+        rgb_panel = prepare_rgb_for_display(rgb_frame_raw)
+        depth_panel = prepare_depth_for_display(depth_frame_raw)
 
-        for ax in self.axes:
-            ax.clear()
+        height = max(rgb_panel.shape[0], depth_panel.shape[0])
+        width = rgb_panel.shape[1] + depth_panel.shape[1] + 16
+        header_height = 92
+        footer_height = 90
+        canvas = np.full((height + header_height + footer_height, width, 3), PANEL_BG, dtype=np.uint8)
 
-        self.axes[0].imshow(rgb_display)
-        self.axes[0].set_title(
-            f"{self.demo_name} frame {self.frame_index}\n"
-            f"{self.args.rgb_key} | dtype={rgb_stats['dtype']} | shape={rgb_stats['shape']}"
-        )
-        self.axes[0].axis("off")
+        rgb_y = header_height
+        depth_y = header_height
+        canvas[rgb_y:rgb_y + rgb_panel.shape[0], 0:rgb_panel.shape[1]] = rgb_panel
+        depth_x = rgb_panel.shape[1] + 16
+        canvas[depth_y:depth_y + depth_panel.shape[0], depth_x:depth_x + depth_panel.shape[1]] = depth_panel
+        canvas[:, rgb_panel.shape[1] + 8:rgb_panel.shape[1] + 9] = SEPARATOR_COLOR
 
-        depth_vmin = depth_stats["min"]
-        depth_vmax = depth_stats["max"]
-        im = self.axes[1].imshow(
-            depth_display, cmap="gray", vmin=depth_vmin, vmax=depth_vmax
-        )
-        self.axes[1].set_title(
-            f"{self.demo_name} frame {self.frame_index}\n"
-            f"{self.args.depth_key} | dtype={depth_stats['dtype']} | shape={depth_stats['shape']}"
-        )
-        self.axes[1].axis("off")
+        header_lines = [
+            f"{self.demo_name} | frame {self.frame_index}/{self.get_frame_count() - 1}",
+            f"rgb key={self.args.rgb_key} | shape={rgb_stats['shape']} | dtype={rgb_stats['dtype']} | min={rgb_stats['min']:.1f} max={rgb_stats['max']:.1f} mean={rgb_stats['mean']:.1f}",
+            f"depth key={self.args.depth_key} | shape={depth_stats['shape']} | dtype={depth_stats['dtype']} | min={depth_stats['min']:.1f} max={depth_stats['max']:.1f} mean={depth_stats['mean']:.1f}",
+        ]
+        footer_lines = [
+            "Keys: Left/Right frame | Up/Down demo | PageUp/PageDown +/-10 | Home/End first/last | s save | h help | q quit",
+        ]
+        put_text_lines(canvas, header_lines, origin_x=12, origin_y=28)
+        put_text_lines(canvas, footer_lines, origin_x=12, origin_y=height + header_height + 30)
 
-        if self.colorbar is not None:
-            self.colorbar.remove()
-        self.colorbar = self.fig.colorbar(im, ax=self.axes[1], fraction=0.046, pad=0.04)
+        cv2.putText(canvas, "RGB", (12, header_height - 12), FONT, 0.7, TEXT_COLOR, 2, cv2.LINE_AA)
+        cv2.putText(canvas, "Depth", (depth_x + 12, header_height - 12), FONT, 0.7, TEXT_COLOR, 2, cv2.LINE_AA)
 
-        self.fig.suptitle(
-            f"RGB vs Processed Depth\n"
-            f"rgb[{rgb_stats['min']:.2f}, {rgb_stats['max']:.2f}]  "
-            f"depth[{depth_stats['min']:.2f}, {depth_stats['max']:.2f}]",
-            fontsize=12,
-        )
-        self.fig.canvas.draw_idle()
+        return canvas
 
     def move_demo(self, delta: int):
         self.demo_pos = max(0, min(self.demo_pos + delta, len(self.demo_names) - 1))
         self.clamp_frame_index()
-        self.refresh(print_current_stats=True)
 
     def move_frame(self, delta: int):
         self.frame_index += delta
         self.clamp_frame_index()
-        self.refresh(print_current_stats=True)
-
-    def on_key_press(self, event):
-        key = (event.key or "").lower()
-        if key in ("left", "a"):
-            self.move_frame(-1)
-        elif key in ("right", "d"):
-            self.move_frame(1)
-        elif key == "pageup":
-            self.move_frame(-10)
-        elif key == "pagedown":
-            self.move_frame(10)
-        elif key == "home":
-            self.frame_index = 0
-            self.refresh(print_current_stats=True)
-        elif key == "end":
-            self.frame_index = self.get_frame_count() - 1
-            self.refresh(print_current_stats=True)
-        elif key in ("up", "w"):
-            self.move_demo(-1)
-        elif key in ("down", "n"):
-            self.move_demo(1)
-        elif key == "s":
-            self.save_current_view()
-        elif key in ("h", "?"):
-            self.print_help()
-        elif key in ("q", "escape"):
-            self.plt.close(self.fig)
-
-    def on_close(self, _event):
-        if self.file is not None:
-            self.file.close()
-            self.file = None
 
 
-def run_static(args, plt):
-    inspector = RgbDepthInspector(args, plt)
-    inspector.refresh(print_current_stats=True)
-
-    if args.save_path is None:
-        out_path = build_default_save_path(args.hdf5, inspector.demo_name, inspector.frame_index)
-    else:
-        out_path = args.save_path
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    inspector.fig.savefig(out_path, dpi=150)
-    print(f"Saved comparison image to: {out_path}")
-
-    if args.show:
-        plt.show()
-    else:
-        plt.close(inspector.fig)
-        inspector.on_close(None)
+class KeyAction:
+    def __init__(self, quit_requested=False, save_requested=False, help_requested=False, demo_delta=0, frame_delta=0, set_home=False, set_end=False):
+        self.quit_requested = quit_requested
+        self.save_requested = save_requested
+        self.help_requested = help_requested
+        self.demo_delta = demo_delta
+        self.frame_delta = frame_delta
+        self.set_home = set_home
+        self.set_end = set_end
 
 
-def run_interactive(args, plt):
-    inspector = RgbDepthInspector(args, plt)
+def decode_key(key_code: int) -> KeyAction:
+    if key_code < 0:
+        return KeyAction()
+
+    if key_code in ESC_CODES or key_code in (ord("q"), ord("Q")):
+        return KeyAction(quit_requested=True)
+    if key_code in (ord("s"), ord("S")):
+        return KeyAction(save_requested=True)
+    if key_code in (ord("h"), ord("H"), ord("?")):
+        return KeyAction(help_requested=True)
+    if key_code in ARROW_LEFT_CODES or key_code in (ord("a"), ord("A")):
+        return KeyAction(frame_delta=-1)
+    if key_code in ARROW_RIGHT_CODES or key_code in (ord("d"), ord("D")):
+        return KeyAction(frame_delta=1)
+    if key_code in PAGE_UP_CODES:
+        return KeyAction(frame_delta=-10)
+    if key_code in PAGE_DOWN_CODES:
+        return KeyAction(frame_delta=10)
+    if key_code in HOME_CODES:
+        return KeyAction(set_home=True)
+    if key_code in END_CODES:
+        return KeyAction(set_end=True)
+    if key_code in ARROW_UP_CODES or key_code in (ord("w"), ord("W")):
+        return KeyAction(demo_delta=-1)
+    if key_code in ARROW_DOWN_CODES or key_code in (ord("n"), ord("N")):
+        return KeyAction(demo_delta=1)
+    return KeyAction()
+
+
+def run_static(args):
+    inspector = RgbDepthInspector(args)
+    try:
+        canvas = inspector.render_current_view(print_current_stats=True)
+        if args.save_path is None:
+            out_path = build_default_save_path(args.hdf5, inspector.demo_name, inspector.frame_index)
+        else:
+            out_path = args.save_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(out_path), canvas)
+        print(f"Saved comparison image to: {out_path}")
+
+        if args.show:
+            cv2.imshow(WINDOW_NAME, canvas)
+            while True:
+                key = cv2.waitKeyEx(0)
+                action = decode_key(key)
+                if action.quit_requested or key >= 0:
+                    break
+            cv2.destroyAllWindows()
+    finally:
+        inspector.close()
+
+
+def run_interactive(args):
+    inspector = RgbDepthInspector(args)
+    cv2.setNumThreads(1)
     inspector.print_help()
-    inspector.refresh(print_current_stats=True)
-    plt.show()
+    try:
+        while True:
+            canvas = inspector.render_current_view(print_current_stats=True)
+            cv2.imshow(WINDOW_NAME, canvas)
+            key = cv2.waitKeyEx(0)
+            action = decode_key(key)
+
+            if action.help_requested:
+                inspector.print_help()
+                continue
+            if action.save_requested:
+                inspector.save_current_view(canvas)
+                continue
+            if action.quit_requested:
+                break
+            if action.set_home:
+                inspector.frame_index = 0
+                continue
+            if action.set_end:
+                inspector.frame_index = inspector.get_frame_count() - 1
+                continue
+            if action.demo_delta != 0:
+                inspector.move_demo(action.demo_delta)
+                continue
+            if action.frame_delta != 0:
+                inspector.move_frame(action.frame_delta)
+                continue
+    finally:
+        inspector.close()
+        cv2.destroyAllWindows()
 
 
 def main():
@@ -373,31 +435,10 @@ def main():
     if not args.hdf5.exists():
         raise FileNotFoundError(args.hdf5)
 
-    import matplotlib
-
-    if args.backend is not None:
-        matplotlib.use(args.backend)
-    elif not args.interactive and not args.show:
-        matplotlib.use("Agg")
-
-    if args.interactive and not args.enable_toolbar:
-        matplotlib.rcParams["toolbar"] = "None"
-
-    from matplotlib import pyplot as plt
-
-    try:
-        if args.interactive:
-            run_interactive(args, plt)
-        else:
-            run_static(args, plt)
-    except Exception as exc:
-        if args.interactive:
-            backend_name = matplotlib.get_backend()
-            print(
-                f"Interactive viewer failed under backend {backend_name}: {exc}\n"
-                "Try running again with --backend QtAgg, or keep the default backend and let the script disable the toolbar."
-            )
-        raise
+    if args.interactive:
+        run_interactive(args)
+    else:
+        run_static(args)
 
 
 if __name__ == "__main__":
