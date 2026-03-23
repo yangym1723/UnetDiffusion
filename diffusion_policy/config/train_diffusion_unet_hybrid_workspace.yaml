@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - task: lift_image_abs
+  - task: ThreeFingers
 
 name: train_diffusion_unet_hybrid
 _target_: diffusion_policy.workspace.train_diffusion_unet_hybrid_workspace.TrainDiffusionUnetHybridWorkspace
@@ -53,7 +53,7 @@ policy:
   crop_shape: [432, 576]
   # crop_shape: null
   diffusion_step_embed_dim: 128
-  down_dims: [512, 1024, 2048]
+  down_dims: [256, 512, 1024]
   kernel_size: 5
   n_groups: 8
   cond_predict_scale: True
@@ -98,18 +98,18 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 64
-  num_workers: 8
+  batch_size: 16
+  num_workers: 4
   shuffle: True
   pin_memory: True
-  persistent_workers: False
+  persistent_workers: True
 
 val_dataloader:
-  batch_size: 64
-  num_workers: 8
+  batch_size: 16
+  num_workers: 4
   shuffle: False
   pin_memory: True
-  persistent_workers: False
+  persistent_workers: True
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -126,17 +126,17 @@ training:
   # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 3050
-  gradient_accumulate_every: 1
+  num_epochs: 1000
+  gradient_accumulate_every: 4
   # EMA destroys performance when used with BatchNorm
   # replace BatchNorm with GroupNorm.
   use_ema: True
   # training loop control
   # in epochs
-  rollout_every: 50
-  checkpoint_every: 50
-  val_every: 1
-  sample_every: 5
+  rollout_every: 100
+  checkpoint_every: 100
+  val_every: 5
+  sample_every: 20
   # steps per epoch
   max_train_steps: null
   max_val_steps: null
@@ -144,7 +144,7 @@ training:
   tqdm_interval_sec: 1.0
 
 logging:
-  project: diffusion_policy_debug
+  project: threefingers_diffusion
   resume: True
   mode: online
   name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}

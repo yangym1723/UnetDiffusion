@@ -1,4 +1,4 @@
-name: lift_image
+name: ThreeFingers
 
 shape_meta: &shape_meta
   # acceptable types: rgb, low_dim
@@ -22,7 +22,7 @@ shape_meta: &shape_meta
     shape: [10]
 
 dataset_path: &dataset_path data/dataset_H480W640_process.hdf5
-abs_action: &abs_action True
+abs_action: &abs_action False
 
 env_runner:
   _target_: diffusion_policy.env_runner.isaaclab_image_runner.IsaacLabImageRunner
@@ -32,7 +32,7 @@ env_runner:
   n_train: 0
   n_train_vis: 0
   train_start_idx: 0
-  n_test: 5
+  n_test: 10
   n_test_vis: 1
   test_start_seed: 100000
   # use python's eval function as resolver, single-quoted string as argument
@@ -88,4 +88,4 @@ dataset:
   use_initial_image_obs_only: True
   use_cache: True
   seed: 42
-  val_ratio: 0.02
+  val_ratio: 0.05
