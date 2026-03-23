@@ -21,6 +21,10 @@ obs_as_global_cond: True
 task:
   dataset:
     return_action_history: ${policy.action_history_rnn.enabled}
+    return_persistent_action_value: ${policy.persistent_action.enabled}
+    persistent_action_indices: ${policy.persistent_action.indices}
+    persistent_action_window: ${policy.persistent_action.warmup_steps}
+    persistent_action_reduce: ${policy.persistent_action.estimate_mode}
 
 policy:
   _target_: diffusion_policy.policy.diffusion_unet_hybrid_image_policy.DiffusionUnetHybridImagePolicy
@@ -61,6 +65,13 @@ policy:
     use_cumulative_sum: True
     output_mlp_dims: []
     nonlinearity: tanh
+  persistent_action:
+    enabled: True
+    indices: [-3, -2]
+    warmup_steps: 50
+    estimate_mode: mean
+    freeze_after_warmup: True
+    use_dataset_anchor_in_training: True
 
   # scheduler.step params
   # predict_epsilon: True

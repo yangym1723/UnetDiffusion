@@ -1,5 +1,4 @@
-from typing import List, Optional
-from matplotlib.pyplot import fill
+from typing import List, Optional, Tuple
 import numpy as np
 import gym
 from gym import spaces
@@ -7,6 +6,42 @@ from omegaconf import OmegaConf
 from robomimic.envs.env_robosuite import EnvRobosuite
 
 class RobomimicImageWrapper(gym.Env):
+    @staticmethod
+    def _get_obs_bounds(key: str, value: dict) -> Tuple[np.ndarray, np.ndarray]:
+        shape = tuple(value['shape'])
+        obs_type = value.get('type', 'low_dim')
+
+        if 'range' in value:
+            low, high = value['range']
+            low = np.full(shape, low, dtype=np.float32)
+            high = np.full(shape, high, dtype=np.float32)
+            return low, high
+
+        if ('low' in value) and ('high' in value):
+            low = np.broadcast_to(np.asarray(value['low'], dtype=np.float32), shape).copy()
+            high = np.broadcast_to(np.asarray(value['high'], dtype=np.float32), shape).copy()
+            return low, high
+
+        if ('min' in value) and ('max' in value):
+            low = np.broadcast_to(np.asarray(value['min'], dtype=np.float32), shape).copy()
+            high = np.broadcast_to(np.asarray(value['max'], dtype=np.float32), shape).copy()
+            return low, high
+
+        if obs_type == 'rgb':
+            low = np.zeros(shape, dtype=np.float32)
+            high = np.ones(shape, dtype=np.float32)
+            return low, high
+
+        if key.endswith('quat'):
+            low = -np.ones(shape, dtype=np.float32)
+            high = np.ones(shape, dtype=np.float32)
+            return low, high
+
+        info = np.finfo(np.float32)
+        low = np.full(shape, info.min, dtype=np.float32)
+        high = np.full(shape, info.max, dtype=np.float32)
+        return low, high
+
     def __init__(self, 
         env: EnvRobosuite,
         shape_meta: dict,
@@ -36,18 +71,7 @@ class RobomimicImageWrapper(gym.Env):
         observation_space = spaces.Dict()
         for key, value in shape_meta['obs'].items():
             shape = value['shape']
-            min_value, max_value = -1, 1
-            if key.endswith('image'):
-                min_value, max_value = 0, 1
-            elif key.endswith('quat'):
-                min_value, max_value = -1, 1
-            elif key.endswith('qpos'):
-                min_value, max_value = -1, 1
-            elif key.endswith('pos'):
-                # better range?
-                min_value, max_value = -1, 1
-            else:
-                raise RuntimeError(f"Unsupported type {key}")
+            min_value, max_value = self._get_obs_bounds(key=key, value=value)
             
             this_space = spaces.Box(
                 low=min_value,

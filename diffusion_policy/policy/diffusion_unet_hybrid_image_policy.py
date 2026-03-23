@@ -20,6 +20,25 @@ import diffusion_policy.model.vision.crop_randomizer as dmvc
 from diffusion_policy.common.pytorch_util import dict_apply, replace_submodules
 
 
+def _resolve_action_indices(indices, action_dim):
+    if indices is None:
+        return []
+
+    resolved = []
+    for idx in indices:
+        idx = int(idx)
+        if idx < 0:
+            idx += action_dim
+        if idx < 0 or idx >= action_dim:
+            raise IndexError(
+                f'action index {idx} is out of bounds for action_dim={action_dim}')
+        resolved.append(idx)
+
+    if len(set(resolved)) != len(resolved):
+        raise ValueError(f'duplicate action indices are not allowed: {resolved}')
+    return resolved
+
+
 class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
     def __init__(self,
             shape_meta: dict,
@@ -38,6 +57,7 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             obs_encoder_group_norm=False,
             eval_fixed_crop=False,
             action_history_rnn=None,
+            persistent_action=None,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -134,6 +154,25 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             )
             self.action_history_feature_dim = self.action_history_encoder.output_dim
 
+        persistent_action = dict(persistent_action or {})
+        self.persistent_action_enabled = bool(persistent_action.pop('enabled', False))
+        self.persistent_action_indices = _resolve_action_indices(
+            persistent_action.pop('indices', []), action_dim)
+        self.persistent_action_warmup_steps = int(persistent_action.pop('warmup_steps', 0))
+        self.persistent_action_estimate_mode = persistent_action.pop('estimate_mode', 'mean')
+        self.persistent_action_freeze_after_warmup = bool(
+            persistent_action.pop('freeze_after_warmup', True))
+        self.persistent_action_use_dataset_anchor_in_training = bool(
+            persistent_action.pop('use_dataset_anchor_in_training', True))
+        if persistent_action:
+            unexpected_keys = ', '.join(sorted(persistent_action.keys()))
+            raise ValueError(f'Unexpected persistent_action keys: {unexpected_keys}')
+        if self.persistent_action_enabled and len(self.persistent_action_indices) == 0:
+            raise ValueError('persistent_action.indices must be non-empty when enabled=True.')
+        if self.persistent_action_estimate_mode not in {'mean', 'last'}:
+            raise ValueError(
+                f'Unsupported persistent_action estimate_mode: {self.persistent_action_estimate_mode}')
+
         input_dim = action_dim + obs_feature_dim
         global_cond_dim = None
         if obs_as_global_cond:
@@ -177,6 +216,10 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         self._history_state = None
         self._history_feature = None
         self._history_cumsum = None
+        self._persistent_action_sum = None
+        self._persistent_action_count = None
+        self._persistent_action_value = None
+        self._persistent_action_frozen = None
 
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
@@ -186,36 +229,58 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         print("Vision params: %e" % sum(p.numel() for p in self.obs_encoder.parameters()))
         if self.action_history_enabled:
             print("History RNN params: %e" % sum(p.numel() for p in self.action_history_encoder.parameters()))
+        if self.persistent_action_enabled:
+            print(f"Persistent action dims: {self.persistent_action_indices}")
 
     def reset(self, mask: Optional[torch.Tensor] = None):
-        if not self.action_history_enabled:
-            return
-        if mask is None or self._history_feature is None:
+        if mask is None:
             self._history_state = None
             self._history_feature = None
             self._history_cumsum = None
+            self._persistent_action_sum = None
+            self._persistent_action_count = None
+            self._persistent_action_value = None
+            self._persistent_action_frozen = None
             return
 
-        mask = mask.to(device=self._history_feature.device, dtype=torch.bool).flatten()
-        if mask.shape[0] != self._history_feature.shape[0]:
-            raise ValueError("History reset mask has incompatible batch dimension.")
+        applied_mask = None
+        if self.action_history_enabled and self._history_feature is not None:
+            applied_mask = mask.to(device=self._history_feature.device, dtype=torch.bool).flatten()
+            if applied_mask.shape[0] != self._history_feature.shape[0]:
+                raise ValueError("History reset mask has incompatible batch dimension.")
 
-        self._history_feature = self._history_feature.clone()
-        self._history_feature[mask] = 0
-        self._history_cumsum = self._history_cumsum.clone()
-        self._history_cumsum[mask] = 0
+            self._history_feature = self._history_feature.clone()
+            self._history_feature[applied_mask] = 0
+            self._history_cumsum = self._history_cumsum.clone()
+            self._history_cumsum[applied_mask] = 0
 
-        if self.action_history_encoder.is_lstm:
-            hidden, cell = self._history_state
-            hidden = hidden.clone()
-            cell = cell.clone()
-            hidden[:, mask] = 0
-            cell[:, mask] = 0
-            self._history_state = (hidden, cell)
-        else:
-            history_state = self._history_state.clone()
-            history_state[:, mask] = 0
-            self._history_state = history_state
+            if self.action_history_encoder.is_lstm:
+                hidden, cell = self._history_state
+                hidden = hidden.clone()
+                cell = cell.clone()
+                hidden[:, applied_mask] = 0
+                cell[:, applied_mask] = 0
+                self._history_state = (hidden, cell)
+            else:
+                history_state = self._history_state.clone()
+                history_state[:, applied_mask] = 0
+                self._history_state = history_state
+
+        if self.persistent_action_enabled and self._persistent_action_value is not None:
+            if applied_mask is None:
+                applied_mask = mask.to(
+                    device=self._persistent_action_value.device, dtype=torch.bool).flatten()
+            if applied_mask.shape[0] != self._persistent_action_value.shape[0]:
+                raise ValueError("Persistent action reset mask has incompatible batch dimension.")
+
+            self._persistent_action_sum = self._persistent_action_sum.clone()
+            self._persistent_action_sum[applied_mask] = 0
+            self._persistent_action_count = self._persistent_action_count.clone()
+            self._persistent_action_count[applied_mask] = 0
+            self._persistent_action_value = self._persistent_action_value.clone()
+            self._persistent_action_value[applied_mask] = 0
+            self._persistent_action_frozen = self._persistent_action_frozen.clone()
+            self._persistent_action_frozen[applied_mask] = False
 
     def _merge_global_condition(self,
             global_cond: Optional[torch.Tensor],
@@ -250,6 +315,34 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
                 dtype=dtype)
         return self._history_feature
 
+    def _ensure_persistent_action_buffers(self, batch_size: int, device, dtype):
+        if not self.persistent_action_enabled:
+            return
+        persistent_dim = len(self.persistent_action_indices)
+        needs_reset = (
+            self._persistent_action_value is None
+            or self._persistent_action_value.shape[0] != batch_size
+            or self._persistent_action_value.device != device
+            or self._persistent_action_value.dtype != dtype
+        )
+        if needs_reset:
+            self._persistent_action_sum = torch.zeros(
+                (batch_size, persistent_dim),
+                device=device,
+                dtype=dtype)
+            self._persistent_action_count = torch.zeros(
+                (batch_size,),
+                device=device,
+                dtype=torch.long)
+            self._persistent_action_value = torch.zeros(
+                (batch_size, persistent_dim),
+                device=device,
+                dtype=dtype)
+            self._persistent_action_frozen = torch.zeros(
+                (batch_size,),
+                device=device,
+                dtype=torch.bool)
+
     def _encode_action_history_from_batch(self, batch: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
         if not self.action_history_enabled:
             return None
@@ -268,6 +361,73 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             device=action_history.device,
             dtype=torch.long)
         return self.action_history_encoder(action_history, action_history_length)
+
+    def _get_persistent_action_value_from_batch(self, batch: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+        if not self.persistent_action_enabled:
+            return None
+        if 'persistent_action_value' not in batch:
+            if self.persistent_action_use_dataset_anchor_in_training:
+                raise RuntimeError(
+                    'Missing `persistent_action_value` in batch. '
+                    'Enable task.dataset.return_persistent_action_value in the config.')
+            return None
+        return batch['persistent_action_value'].to(device=self.device, dtype=self.dtype)
+
+    def _apply_persistent_action_anchor(self,
+            action_tensor: torch.Tensor,
+            persistent_action_value: Optional[torch.Tensor]) -> torch.Tensor:
+        if persistent_action_value is None:
+            return action_tensor
+        action_tensor = action_tensor.clone()
+        action_tensor[..., self.persistent_action_indices] = persistent_action_value.unsqueeze(1)
+        return action_tensor
+
+    def _apply_online_persistent_action(
+            self,
+            action_chunk: torch.Tensor,
+            max_update_steps: Optional[int] = None) -> torch.Tensor:
+        if not self.persistent_action_enabled:
+            return action_chunk
+
+        action_chunk = action_chunk.clone()
+        self._ensure_persistent_action_buffers(
+            batch_size=action_chunk.shape[0],
+            device=action_chunk.device,
+            dtype=action_chunk.dtype)
+
+        freeze_threshold = max(self.persistent_action_warmup_steps, 1)
+        update_steps = action_chunk.shape[1]
+        if max_update_steps is not None:
+            update_steps = min(update_steps, int(max_update_steps))
+        for step_idx in range(update_steps):
+            active_mask = ~self._persistent_action_frozen
+            if active_mask.any():
+                current_values = action_chunk[active_mask, step_idx][:, self.persistent_action_indices]
+                if self.persistent_action_estimate_mode == 'mean':
+                    self._persistent_action_sum[active_mask] = (
+                        self._persistent_action_sum[active_mask] + current_values)
+                    self._persistent_action_count[active_mask] = (
+                        self._persistent_action_count[active_mask] + 1)
+                    count = self._persistent_action_count[active_mask].to(
+                        dtype=action_chunk.dtype).unsqueeze(-1)
+                    self._persistent_action_value[active_mask] = (
+                        self._persistent_action_sum[active_mask] / count)
+                else:
+                    self._persistent_action_value[active_mask] = current_values
+                    self._persistent_action_count[active_mask] = (
+                        self._persistent_action_count[active_mask] + 1)
+
+                if self.persistent_action_freeze_after_warmup:
+                    newly_frozen = (
+                        ~self._persistent_action_frozen
+                    ) & (self._persistent_action_count >= freeze_threshold)
+                    self._persistent_action_frozen[newly_frozen] = True
+
+            frozen_mask = self._persistent_action_frozen
+            if frozen_mask.any():
+                action_chunk[frozen_mask, step_idx, self.persistent_action_indices] = (
+                    self._persistent_action_value[frozen_mask])
+        return action_chunk
 
     def _update_history_from_action_chunk(self, naction: torch.Tensor):
         if not self.action_history_enabled:
@@ -321,7 +481,10 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
     def _predict_action_internal(self,
             obs_dict: Dict[str, torch.Tensor],
             history_feature: Optional[torch.Tensor],
-            update_history: bool) -> Dict[str, torch.Tensor]:
+            update_history: bool,
+            update_persistent_action: bool,
+            persistent_update_steps: Optional[int] = None,
+            persistent_action_value: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         nobs = self.normalizer.normalize(obs_dict)
         value = next(iter(nobs.values()))
         batch_size, _, = value.shape[:2]
@@ -367,8 +530,18 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
 
         start = n_obs_steps - 1
         end = start + self.n_action_steps
-        naction = naction_pred[:, start:end]
         action = action_pred[:, start:end]
+        if persistent_action_value is not None:
+            action_pred = self._apply_persistent_action_anchor(action_pred, persistent_action_value)
+            action = action_pred[:, start:end]
+        elif update_persistent_action and self.persistent_action_enabled:
+            action = self._apply_online_persistent_action(
+                action,
+                max_update_steps=persistent_update_steps)
+            action_pred = action_pred.clone()
+            action_pred[:, start:end] = action
+
+        naction = self.normalizer['action'].normalize(action)
 
         if update_history and self.action_history_enabled:
             self._update_history_from_action_chunk(naction)
@@ -390,14 +563,36 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         return self._predict_action_internal(
             obs_dict=obs_dict,
             history_feature=history_feature,
-            update_history=True)
+            update_history=True,
+            update_persistent_action=True,
+            persistent_update_steps=None)
+
+    def observe_only(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        assert 'past_action' not in obs_dict
+        history_feature = None
+        if self.action_history_enabled:
+            value = next(iter(obs_dict.values()))
+            history_feature = self._ensure_history_buffers(
+                batch_size=value.shape[0],
+                device=self.device,
+                dtype=self.dtype)
+        return self._predict_action_internal(
+            obs_dict=obs_dict,
+            history_feature=history_feature,
+            update_history=False,
+            update_persistent_action=True,
+            persistent_update_steps=1)
 
     def predict_action_from_batch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         history_feature = self._encode_action_history_from_batch(batch)
+        persistent_action_value = self._get_persistent_action_value_from_batch(batch)
         return self._predict_action_internal(
             obs_dict=batch['obs'],
             history_feature=history_feature,
-            update_history=False)
+            update_history=False,
+            update_persistent_action=False,
+            persistent_update_steps=None,
+            persistent_action_value=persistent_action_value)
 
     def set_normalizer(self, normalizer: LinearNormalizer):
         self.normalizer.load_state_dict(normalizer.state_dict())
@@ -409,6 +604,13 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
         history_feature = self._encode_action_history_from_batch(batch)
+        persistent_action_value = self._get_persistent_action_value_from_batch(batch)
+        if persistent_action_value is not None and self.persistent_action_use_dataset_anchor_in_training:
+            normalized_persistent_action_value = self.normalizer['action'].normalize(
+                persistent_action_value)
+            nactions = nactions.clone()
+            nactions[..., self.persistent_action_indices] = (
+                normalized_persistent_action_value.unsqueeze(1))
 
         local_cond = None
         global_cond = None

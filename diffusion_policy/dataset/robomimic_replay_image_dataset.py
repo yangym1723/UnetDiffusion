@@ -43,6 +43,11 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             rotation_rep='rotation_6d', # ignored when abs_action=False
             use_legacy_normalizer=False,
             return_action_history=False,
+            return_persistent_action_value=False,
+            persistent_action_indices=None,
+            persistent_action_window=0,
+            persistent_action_reduce='mean',
+            use_initial_image_obs_only=False,
             use_cache=False,
             seed=42,
             val_ratio=0.0
@@ -51,8 +56,22 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             from_rep='axis_angle', to_rep=rotation_rep)
 
         replay_buffer = None
+        cache_config = {
+            'shape_meta': OmegaConf.to_container(shape_meta, resolve=True)
+                if OmegaConf.is_config(shape_meta) else copy.deepcopy(shape_meta),
+            'abs_action': abs_action,
+            'rotation_rep': rotation_rep,
+            'return_persistent_action_value': return_persistent_action_value,
+            'persistent_action_indices': persistent_action_indices,
+            'persistent_action_window': persistent_action_window,
+            'persistent_action_reduce': persistent_action_reduce,
+            'use_initial_image_obs_only': use_initial_image_obs_only,
+        }
+        cache_hash = hashlib.sha1(
+            json.dumps(cache_config, sort_keys=True).encode('utf-8')
+        ).hexdigest()[:10]
         if use_cache:
-            cache_zarr_path = dataset_path + '.zarr.zip'
+            cache_zarr_path = dataset_path + f'.{cache_hash}.zarr.zip'
             cache_lock_path = cache_zarr_path + '.lock'
             print('Acquiring lock on cache.')
             with FileLock(cache_lock_path):
@@ -66,7 +85,8 @@ class RobomimicReplayImageDataset(BaseImageDataset):
                             shape_meta=shape_meta, 
                             dataset_path=dataset_path, 
                             abs_action=abs_action, 
-                            rotation_transformer=rotation_transformer)
+                            rotation_transformer=rotation_transformer,
+                            use_initial_image_obs_only=use_initial_image_obs_only)
                         print('Saving cache to disk.')
                         with zarr.ZipStore(cache_zarr_path) as zip_store:
                             replay_buffer.save_to_store(
@@ -87,7 +107,8 @@ class RobomimicReplayImageDataset(BaseImageDataset):
                 shape_meta=shape_meta, 
                 dataset_path=dataset_path, 
                 abs_action=abs_action, 
-                rotation_transformer=rotation_transformer)
+                rotation_transformer=rotation_transformer,
+                use_initial_image_obs_only=use_initial_image_obs_only)
 
         rgb_keys = list()
         lowdim_keys = list()
@@ -124,6 +145,7 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         self.replay_buffer = replay_buffer
         self.sampler = sampler
         self.shape_meta = shape_meta
+        self.obs_shape_meta = obs_shape_meta
         self.rgb_keys = rgb_keys
         self.lowdim_keys = lowdim_keys
         self.abs_action = abs_action
@@ -134,7 +156,13 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         self.pad_after = pad_after
         self.use_legacy_normalizer = use_legacy_normalizer
         self.return_action_history = return_action_history
+        self.return_persistent_action_value = return_persistent_action_value
+        self.use_initial_image_obs_only = use_initial_image_obs_only
         self.action_dim = shape_meta['action']['shape'][0]
+        self.persistent_action_indices = _resolve_action_indices(
+            persistent_action_indices, self.action_dim)
+        self.persistent_action_window = int(persistent_action_window)
+        self.persistent_action_reduce = persistent_action_reduce
         self.episode_ends = replay_buffer.episode_ends[:].astype(np.int64)
         self.episode_starts = np.concatenate([
             np.zeros((1,), dtype=np.int64),
@@ -176,16 +204,25 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         # obs
         for key in self.lowdim_keys:
             stat = array_to_stats(self.replay_buffer[key])
+            attr = self.obs_shape_meta[key]
+            normalizer_type = attr.get('normalizer', None)
 
-            if key.endswith('pos'):
+            if normalizer_type == 'identity':
+                this_normalizer = get_identity_normalizer_from_stat(stat)
+            elif normalizer_type == 'range':
                 this_normalizer = get_range_normalizer_from_stat(stat)
             elif key.endswith('quat'):
                 # quaternion is in [-1,1] already
                 this_normalizer = get_identity_normalizer_from_stat(stat)
+            elif key.endswith('pos'):
+                this_normalizer = get_range_normalizer_from_stat(stat)
             elif key.endswith('qpos'):
                 this_normalizer = get_range_normalizer_from_stat(stat)
             else:
-                raise RuntimeError('unsupported')
+                # Custom IsaacLab keys (for example ee_pose/contact_force_z)
+                # should remain usable without renaming them to robomimic
+                # suffix conventions.
+                this_normalizer = get_range_normalizer_from_stat(stat)
             normalizer[key] = this_normalizer
 
         # image
@@ -231,6 +268,9 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             torch_data['action_history'] = torch.from_numpy(action_history)
             torch_data['action_history_mask'] = torch.from_numpy(action_history_mask)
             torch_data['action_history_length'] = torch.tensor(action_history_length, dtype=torch.long)
+        if self.return_persistent_action_value:
+            persistent_action_value = self._get_persistent_action_value(idx)
+            torch_data['persistent_action_value'] = torch.from_numpy(persistent_action_value)
         return torch_data
 
     def _get_action_history(self, idx: int):
@@ -258,6 +298,33 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             history_mask[:action_history_length] = True
         return padded_history, history_mask, action_history_length
 
+    def _get_persistent_action_value(self, idx: int):
+        if len(self.persistent_action_indices) == 0:
+            raise RuntimeError(
+                'persistent_action_indices is empty while return_persistent_action_value=True.')
+
+        buffer_start_idx, _, _, _ = self.sampler.indices[idx]
+        episode_idx = np.searchsorted(self.episode_ends, buffer_start_idx, side='right')
+        episode_start = int(self.episode_starts[episode_idx])
+        episode_end = int(self.episode_ends[episode_idx])
+
+        window_end = episode_end
+        if self.persistent_action_window > 0:
+            window_end = min(episode_start + self.persistent_action_window, episode_end)
+        action_window = self.replay_buffer['action'][episode_start:window_end].astype(np.float32)
+        if action_window.shape[0] == 0:
+            raise RuntimeError('persistent action window is empty.')
+
+        selected = action_window[:, self.persistent_action_indices]
+        if self.persistent_action_reduce == 'mean':
+            persistent_action_value = selected.mean(axis=0)
+        elif self.persistent_action_reduce == 'last':
+            persistent_action_value = selected[-1]
+        else:
+            raise ValueError(
+                f'Unsupported persistent_action_reduce: {self.persistent_action_reduce}')
+        return persistent_action_value.astype(np.float32)
+
 
 def _convert_actions(raw_actions, abs_action, rotation_transformer):
     actions = raw_actions
@@ -282,8 +349,27 @@ def _convert_actions(raw_actions, abs_action, rotation_transformer):
     return actions
 
 
-def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, rotation_transformer, 
-        n_workers=None, max_inflight_tasks=None):
+def _resolve_action_indices(indices, action_dim):
+    if indices is None:
+        return []
+
+    resolved = []
+    for idx in indices:
+        idx = int(idx)
+        if idx < 0:
+            idx += action_dim
+        if idx < 0 or idx >= action_dim:
+            raise IndexError(
+                f'action index {idx} is out of bounds for action_dim={action_dim}')
+        resolved.append(idx)
+
+    if len(set(resolved)) != len(resolved):
+        raise ValueError(f'duplicate action indices are not allowed: {resolved}')
+    return resolved
+
+
+def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, rotation_transformer,
+        use_initial_image_obs_only=False, n_workers=None, max_inflight_tasks=None):
     if n_workers is None:
         n_workers = multiprocessing.cpu_count()
     if max_inflight_tasks is None:
@@ -350,9 +436,9 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
                 dtype=this_data.dtype
             )
         
-        def img_copy(zarr_arr, zarr_idx, hdf5_arr, hdf5_idx):
+        def img_copy(zarr_arr, zarr_idx, image):
             try:
-                zarr_arr[zarr_idx] = hdf5_arr[hdf5_idx]
+                zarr_arr[zarr_idx] = image
                 # make sure we can successfully decode
                 _ = zarr_arr[zarr_idx]
                 return True
@@ -378,7 +464,24 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
                     for episode_idx in range(len(demos)):
                         demo = demos[f'demo_{episode_idx}']
                         hdf5_arr = demo['obs'][key]
-                        for hdf5_idx in range(hdf5_arr.shape[0]):
+                        episode_length = int(demo['actions'].shape[0])
+                        if hdf5_arr.shape[0] == 0:
+                            raise RuntimeError(
+                                f'Image key `{key}` in demo_{episode_idx} has zero frames.')
+
+                        if use_initial_image_obs_only:
+                            image_sequence = [hdf5_arr[0]] * episode_length
+                        else:
+                            if hdf5_arr.shape[0] != episode_length:
+                                raise RuntimeError(
+                                    f'Image key `{key}` in demo_{episode_idx} has '
+                                    f'{hdf5_arr.shape[0]} frames, but actions has '
+                                    f'{episode_length} steps. Set '
+                                    f'`task.dataset.use_initial_image_obs_only=True` '
+                                    f'to broadcast the first frame across the episode.')
+                            image_sequence = [hdf5_arr[hdf5_idx] for hdf5_idx in range(hdf5_arr.shape[0])]
+
+                        for hdf5_idx, image in enumerate(image_sequence):
                             if len(futures) >= max_inflight_tasks:
                                 # limit number of inflight tasks
                                 completed, futures = concurrent.futures.wait(futures, 
@@ -391,7 +494,7 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
                             zarr_idx = episode_starts[episode_idx] + hdf5_idx
                             futures.add(
                                 executor.submit(img_copy, 
-                                    img_arr, zarr_idx, hdf5_arr, hdf5_idx))
+                                    img_arr, zarr_idx, image))
                 completed, futures = concurrent.futures.wait(futures)
                 for f in completed:
                     if not f.result():
