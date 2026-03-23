@@ -1,8 +1,19 @@
 from typing import Union
-import pytorch3d.transforms as pt
 import torch
 import numpy as np
 import functools
+
+
+def _import_pytorch3d_transforms():
+    try:
+        import pytorch3d.transforms as pt  # type: ignore
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            "RotationTransformer requires `pytorch3d`. Install it only if you "
+            "use action preprocessing paths that convert between rotation "
+            "representations."
+        ) from e
+    return pt
 
 class RotationTransformer:
     valid_reps = [
@@ -30,6 +41,8 @@ class RotationTransformer:
             assert from_convention is not None
         if to_rep == 'euler_angles':
             assert to_convention is not None
+
+        pt = _import_pytorch3d_transforms()
 
         forward_funcs = list()
         inverse_funcs = list()

@@ -7,7 +7,6 @@ import copy
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.dataset.base_dataset import BaseLowdimDataset, LinearNormalizer
 from diffusion_policy.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
-from diffusion_policy.model.common.rotation_transformer import RotationTransformer
 from diffusion_policy.common.replay_buffer import ReplayBuffer
 from diffusion_policy.common.sampler import (
     SequenceSampler, get_val_mask, downsample_mask)
@@ -17,6 +16,16 @@ from diffusion_policy.common.normalize_util import (
     get_identity_normalizer_from_stat,
     array_to_stats
 )
+
+
+def _build_rotation_transformer_if_needed(abs_action, rotation_rep):
+    if not abs_action:
+        return None
+
+    from diffusion_policy.model.common.rotation_transformer import RotationTransformer
+
+    return RotationTransformer(
+        from_rep='axis_angle', to_rep=rotation_rep)
 
 class RobomimicReplayLowdimDataset(BaseLowdimDataset):
     def __init__(self,
@@ -37,8 +46,9 @@ class RobomimicReplayLowdimDataset(BaseLowdimDataset):
             max_train_episodes=None
         ):
         obs_keys = list(obs_keys)
-        rotation_transformer = RotationTransformer(
-            from_rep='axis_angle', to_rep=rotation_rep)
+        rotation_transformer = _build_rotation_transformer_if_needed(
+            abs_action=abs_action,
+            rotation_rep=rotation_rep)
 
         replay_buffer = ReplayBuffer.create_empty_numpy()
         with h5py.File(dataset_path) as file:
@@ -144,6 +154,9 @@ def _data_to_obs(raw_obs, raw_actions, obs_keys, abs_action, rotation_transforme
     ], axis=-1).astype(np.float32)
 
     if abs_action:
+        if rotation_transformer is None:
+            raise RuntimeError(
+                "rotation_transformer is required when abs_action=True.")
         is_dual_arm = False
         if raw_actions.shape[-1] == 14:
             # dual arm

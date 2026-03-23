@@ -17,7 +17,6 @@ from omegaconf import OmegaConf
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.dataset.base_dataset import BaseImageDataset, LinearNormalizer
 from diffusion_policy.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
-from diffusion_policy.model.common.rotation_transformer import RotationTransformer
 from diffusion_policy.codecs.imagecodecs_numcodecs import register_codecs, Jpeg2k
 from diffusion_policy.common.replay_buffer import ReplayBuffer
 from diffusion_policy.common.sampler import SequenceSampler, get_val_mask
@@ -31,6 +30,16 @@ from diffusion_policy.common.normalize_util import (
     array_to_stats
 )
 register_codecs()
+
+
+def _build_rotation_transformer_if_needed(abs_action, rotation_rep, action_preprocess):
+    if action_preprocess == 'pos_quat' or not abs_action:
+        return None
+
+    from diffusion_policy.model.common.rotation_transformer import RotationTransformer
+
+    return RotationTransformer(
+        from_rep='axis_angle', to_rep=rotation_rep)
 
 class RobomimicReplayImageDataset(BaseImageDataset):
     def __init__(self,
@@ -66,8 +75,10 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         if action_preprocess not in {'auto', 'pos_quat'}:
             raise ValueError(f'Unsupported action_preprocess: {action_preprocess}')
 
-        rotation_transformer = RotationTransformer(
-            from_rep='axis_angle', to_rep=rotation_rep)
+        rotation_transformer = _build_rotation_transformer_if_needed(
+            abs_action=abs_action,
+            rotation_rep=rotation_rep,
+            action_preprocess=action_preprocess)
 
         replay_buffer = None
         cache_config = {
@@ -414,6 +425,10 @@ def _convert_actions(
         return actions
 
     if abs_action:
+        if rotation_transformer is None:
+            raise RuntimeError(
+                "rotation_transformer is required when abs_action=True and "
+                "action_preprocess is not `pos_quat`.")
         is_dual_arm = False
         if raw_actions.shape[-1] == 14:
             # dual arm
