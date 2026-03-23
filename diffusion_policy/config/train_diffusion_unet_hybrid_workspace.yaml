@@ -25,6 +25,10 @@ task:
     persistent_action_indices: ${policy.persistent_action.indices}
     persistent_action_window: ${policy.persistent_action.warmup_steps}
     persistent_action_reduce: ${policy.persistent_action.estimate_mode}
+    binary_action_indices: ${policy.binary_action.indices}
+    binary_action_low: ${policy.binary_action.low_value}
+    binary_action_high: ${policy.binary_action.high_value}
+    binary_action_threshold: ${policy.binary_action.threshold}
 
 policy:
   _target_: diffusion_policy.policy.diffusion_unet_hybrid_image_policy.DiffusionUnetHybridImagePolicy
@@ -72,6 +76,15 @@ policy:
     estimate_mode: mean
     freeze_after_warmup: True
     use_dataset_anchor_in_training: True
+  binary_action:
+    enabled: True
+    indices: [-1]
+    low_value: -1.0
+    high_value: 1.0
+    threshold: 0.0
+  quaternion_action:
+    enabled: True
+    indices: [3, 4, 5, 6]
 
   # scheduler.step params
   # predict_epsilon: True

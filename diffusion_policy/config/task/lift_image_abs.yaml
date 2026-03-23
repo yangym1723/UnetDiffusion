@@ -54,6 +54,11 @@ env_runner:
   depth_invert: False
   use_initial_image_obs_only: True
   observe_before_act_steps: ${policy.persistent_action.warmup_steps}
+  binary_action_indices: ${policy.binary_action.indices}
+  binary_action_low: ${policy.binary_action.low_value}
+  binary_action_high: ${policy.binary_action.high_value}
+  binary_action_threshold: ${policy.binary_action.threshold}
+  quaternion_action_indices: ${task.dataset.action_quat_indices}
 # evaluation at this config requires a 16 core 64GB instance.
 
 dataset:
@@ -65,12 +70,21 @@ dataset:
   pad_after: ${eval:'${n_action_steps}-1'}
   n_obs_steps: ${dataset_obs_steps}
   abs_action: *abs_action
+  action_preprocess: pos_quat
+  action_pos_indices: [0, 1, 2]
+  action_quat_indices: [3, 4, 5, 6]
+  action_range_indices: [7, 8]
+  normalize_action_quaternion: True
   rotation_rep: 'rotation_6d'
   use_legacy_normalizer: False
   return_persistent_action_value: False
   persistent_action_indices: []
   persistent_action_window: 0
   persistent_action_reduce: mean
+  binary_action_indices: []
+  binary_action_low: -1.0
+  binary_action_high: 1.0
+  binary_action_threshold: 0.0
   use_initial_image_obs_only: True
   use_cache: True
   seed: 42

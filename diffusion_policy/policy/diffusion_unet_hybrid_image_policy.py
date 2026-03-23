@@ -39,6 +39,34 @@ def _resolve_action_indices(indices, action_dim):
     return resolved
 
 
+def _quantize_action_tensor(
+        action_tensor: torch.Tensor,
+        indices,
+        low_value: float,
+        high_value: float,
+        threshold: float) -> torch.Tensor:
+    if len(indices) == 0:
+        return action_tensor
+    action_tensor = action_tensor.clone()
+    selected = action_tensor[..., indices]
+    quantized = torch.where(
+        selected >= threshold,
+        torch.full_like(selected, high_value),
+        torch.full_like(selected, low_value))
+    action_tensor[..., indices] = quantized
+    return action_tensor
+
+
+def _normalize_quaternion_tensor(action_tensor: torch.Tensor, indices) -> torch.Tensor:
+    if len(indices) == 0:
+        return action_tensor
+    action_tensor = action_tensor.clone()
+    quat = action_tensor[..., indices]
+    quat_norm = torch.linalg.norm(quat, dim=-1, keepdim=True).clamp_min(1e-8)
+    action_tensor[..., indices] = quat / quat_norm
+    return action_tensor
+
+
 class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
     def __init__(self,
             shape_meta: dict,
@@ -58,6 +86,8 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             eval_fixed_crop=False,
             action_history_rnn=None,
             persistent_action=None,
+            binary_action=None,
+            quaternion_action=None,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -173,6 +203,29 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             raise ValueError(
                 f'Unsupported persistent_action estimate_mode: {self.persistent_action_estimate_mode}')
 
+        binary_action = dict(binary_action or {})
+        self.binary_action_enabled = bool(binary_action.pop('enabled', False))
+        self.binary_action_indices = _resolve_action_indices(
+            binary_action.pop('indices', []), action_dim)
+        self.binary_action_low = float(binary_action.pop('low_value', -1.0))
+        self.binary_action_high = float(binary_action.pop('high_value', 1.0))
+        self.binary_action_threshold = float(binary_action.pop('threshold', 0.0))
+        if binary_action:
+            unexpected_keys = ', '.join(sorted(binary_action.keys()))
+            raise ValueError(f'Unexpected binary_action keys: {unexpected_keys}')
+        if self.binary_action_enabled and len(self.binary_action_indices) == 0:
+            raise ValueError('binary_action.indices must be non-empty when enabled=True.')
+
+        quaternion_action = dict(quaternion_action or {})
+        self.quaternion_action_enabled = bool(quaternion_action.pop('enabled', False))
+        self.quaternion_action_indices = _resolve_action_indices(
+            quaternion_action.pop('indices', []), action_dim)
+        if quaternion_action:
+            unexpected_keys = ', '.join(sorted(quaternion_action.keys()))
+            raise ValueError(f'Unexpected quaternion_action keys: {unexpected_keys}')
+        if self.quaternion_action_enabled and len(self.quaternion_action_indices) == 0:
+            raise ValueError('quaternion_action.indices must be non-empty when enabled=True.')
+
         input_dim = action_dim + obs_feature_dim
         global_cond_dim = None
         if obs_as_global_cond:
@@ -231,6 +284,10 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             print("History RNN params: %e" % sum(p.numel() for p in self.action_history_encoder.parameters()))
         if self.persistent_action_enabled:
             print(f"Persistent action dims: {self.persistent_action_indices}")
+        if self.binary_action_enabled:
+            print(f"Binary action dims: {self.binary_action_indices}")
+        if self.quaternion_action_enabled:
+            print(f"Quaternion action dims: {self.quaternion_action_indices}")
 
     def reset(self, mask: Optional[torch.Tensor] = None):
         if mask is None:
@@ -352,7 +409,10 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
                 raise RuntimeError(
                     f"Missing `{key}` in batch. Enable task.dataset.return_action_history in the config.")
 
-        action_history = self.normalizer['action'].normalize(batch['action_history'])
+        action_history = batch['action_history']
+        if self.binary_action_enabled:
+            action_history = self._apply_binary_action_quantization(action_history)
+        action_history = self.normalizer['action'].normalize(action_history)
         action_history_mask = batch['action_history_mask'].to(
             device=action_history.device,
             dtype=action_history.dtype).unsqueeze(-1)
@@ -381,6 +441,23 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         action_tensor = action_tensor.clone()
         action_tensor[..., self.persistent_action_indices] = persistent_action_value.unsqueeze(1)
         return action_tensor
+
+    def _apply_binary_action_quantization(self, action_tensor: torch.Tensor) -> torch.Tensor:
+        if not self.binary_action_enabled:
+            return action_tensor
+        return _quantize_action_tensor(
+            action_tensor,
+            self.binary_action_indices,
+            self.binary_action_low,
+            self.binary_action_high,
+            self.binary_action_threshold)
+
+    def _normalize_quaternion_action(self, action_tensor: torch.Tensor) -> torch.Tensor:
+        if not self.quaternion_action_enabled:
+            return action_tensor
+        return _normalize_quaternion_tensor(
+            action_tensor,
+            self.quaternion_action_indices)
 
     def _apply_online_persistent_action(
             self,
@@ -541,6 +618,10 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             action_pred = action_pred.clone()
             action_pred[:, start:end] = action
 
+        action_pred = self._normalize_quaternion_action(action_pred)
+        action_pred = self._apply_binary_action_quantization(action_pred)
+        action = action_pred[:, start:end]
+
         naction = self.normalizer['action'].normalize(action)
 
         if update_history and self.action_history_enabled:
@@ -600,7 +681,10 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
     def compute_loss(self, batch):
         assert 'valid_mask' not in batch
         nobs = self.normalizer.normalize(batch['obs'])
-        nactions = self.normalizer['action'].normalize(batch['action'])
+        actions = batch['action']
+        if self.binary_action_enabled:
+            actions = self._apply_binary_action_quantization(actions)
+        nactions = self.normalizer['action'].normalize(actions)
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
         history_feature = self._encode_action_history_from_batch(batch)

@@ -44,6 +44,39 @@ def get_identity_normalizer_from_stat(stat):
         input_stats_dict=stat
     )
 
+
+def get_mixed_normalizer_from_stat(
+        stat,
+        range_indices=None,
+        output_max=1,
+        output_min=-1,
+        range_eps=1e-7):
+    range_indices = [] if range_indices is None else [int(idx) for idx in range_indices]
+
+    scale = np.ones_like(stat['min'])
+    offset = np.zeros_like(stat['min'])
+    if len(range_indices) > 0:
+        range_indices = np.asarray(range_indices, dtype=np.int64)
+        input_max = stat['max'][range_indices]
+        input_min = stat['min'][range_indices]
+        input_range = input_max - input_min
+        ignore_dim = input_range < range_eps
+        input_range[ignore_dim] = output_max - output_min
+
+        range_scale = (output_max - output_min) / input_range
+        range_offset = output_min - range_scale * input_min
+        range_offset[ignore_dim] = (
+            (output_max + output_min) / 2 - input_min[ignore_dim])
+
+        scale[range_indices] = range_scale
+        offset[range_indices] = range_offset
+
+    return SingleFieldLinearNormalizer.create_manual(
+        scale=scale,
+        offset=offset,
+        input_stats_dict=stat
+    )
+
 def robomimic_abs_action_normalizer_from_stat(stat, rotation_transformer):
     result = dict_apply_split(
         stat, lambda x: {

@@ -25,6 +25,7 @@ from diffusion_policy.common.normalize_util import (
     robomimic_abs_action_only_normalizer_from_stat,
     robomimic_abs_action_only_dual_arm_normalizer_from_stat,
     get_range_normalizer_from_stat,
+    get_mixed_normalizer_from_stat,
     get_image_range_normalizer,
     get_identity_normalizer_from_stat,
     array_to_stats
@@ -41,17 +42,30 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             n_obs_steps=None,
             abs_action=False,
             rotation_rep='rotation_6d', # ignored when abs_action=False
+            action_preprocess='auto',
+            action_pos_indices=None,
+            action_quat_indices=None,
+            action_range_indices=None,
+            normalize_action_quaternion=False,
             use_legacy_normalizer=False,
             return_action_history=False,
             return_persistent_action_value=False,
             persistent_action_indices=None,
             persistent_action_window=0,
             persistent_action_reduce='mean',
+            binary_action_indices=None,
+            binary_action_low=-1.0,
+            binary_action_high=1.0,
+            binary_action_threshold=0.0,
             use_initial_image_obs_only=False,
             use_cache=False,
             seed=42,
             val_ratio=0.0
         ):
+        action_preprocess = str(action_preprocess).lower()
+        if action_preprocess not in {'auto', 'pos_quat'}:
+            raise ValueError(f'Unsupported action_preprocess: {action_preprocess}')
+
         rotation_transformer = RotationTransformer(
             from_rep='axis_angle', to_rep=rotation_rep)
 
@@ -61,10 +75,19 @@ class RobomimicReplayImageDataset(BaseImageDataset):
                 if OmegaConf.is_config(shape_meta) else copy.deepcopy(shape_meta),
             'abs_action': abs_action,
             'rotation_rep': rotation_rep,
+            'action_preprocess': action_preprocess,
+            'action_pos_indices': action_pos_indices,
+            'action_quat_indices': action_quat_indices,
+            'action_range_indices': action_range_indices,
+            'normalize_action_quaternion': normalize_action_quaternion,
             'return_persistent_action_value': return_persistent_action_value,
             'persistent_action_indices': persistent_action_indices,
             'persistent_action_window': persistent_action_window,
             'persistent_action_reduce': persistent_action_reduce,
+            'binary_action_indices': binary_action_indices,
+            'binary_action_low': binary_action_low,
+            'binary_action_high': binary_action_high,
+            'binary_action_threshold': binary_action_threshold,
             'use_initial_image_obs_only': use_initial_image_obs_only,
         }
         cache_hash = hashlib.sha1(
@@ -86,6 +109,15 @@ class RobomimicReplayImageDataset(BaseImageDataset):
                             dataset_path=dataset_path, 
                             abs_action=abs_action, 
                             rotation_transformer=rotation_transformer,
+                            action_preprocess=action_preprocess,
+                            action_pos_indices=action_pos_indices,
+                            action_quat_indices=action_quat_indices,
+                            action_range_indices=action_range_indices,
+                            normalize_action_quaternion=normalize_action_quaternion,
+                            binary_action_indices=binary_action_indices,
+                            binary_action_low=binary_action_low,
+                            binary_action_high=binary_action_high,
+                            binary_action_threshold=binary_action_threshold,
                             use_initial_image_obs_only=use_initial_image_obs_only)
                         print('Saving cache to disk.')
                         with zarr.ZipStore(cache_zarr_path) as zip_store:
@@ -108,6 +140,15 @@ class RobomimicReplayImageDataset(BaseImageDataset):
                 dataset_path=dataset_path, 
                 abs_action=abs_action, 
                 rotation_transformer=rotation_transformer,
+                action_preprocess=action_preprocess,
+                action_pos_indices=action_pos_indices,
+                action_quat_indices=action_quat_indices,
+                action_range_indices=action_range_indices,
+                normalize_action_quaternion=normalize_action_quaternion,
+                binary_action_indices=binary_action_indices,
+                binary_action_low=binary_action_low,
+                binary_action_high=binary_action_high,
+                binary_action_threshold=binary_action_threshold,
                 use_initial_image_obs_only=use_initial_image_obs_only)
 
         rgb_keys = list()
@@ -159,10 +200,20 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         self.return_persistent_action_value = return_persistent_action_value
         self.use_initial_image_obs_only = use_initial_image_obs_only
         self.action_dim = shape_meta['action']['shape'][0]
+        self.action_preprocess = action_preprocess
+        self.action_pos_indices = _resolve_action_indices(action_pos_indices, self.action_dim)
+        self.action_quat_indices = _resolve_action_indices(action_quat_indices, self.action_dim)
+        self.action_range_indices = _resolve_action_indices(action_range_indices, self.action_dim)
+        self.normalize_action_quaternion = bool(normalize_action_quaternion)
         self.persistent_action_indices = _resolve_action_indices(
             persistent_action_indices, self.action_dim)
         self.persistent_action_window = int(persistent_action_window)
         self.persistent_action_reduce = persistent_action_reduce
+        self.binary_action_indices = _resolve_action_indices(
+            binary_action_indices, self.action_dim)
+        self.binary_action_low = float(binary_action_low)
+        self.binary_action_high = float(binary_action_high)
+        self.binary_action_threshold = float(binary_action_threshold)
         self.episode_ends = replay_buffer.episode_ends[:].astype(np.int64)
         self.episode_starts = np.concatenate([
             np.zeros((1,), dtype=np.int64),
@@ -187,7 +238,12 @@ class RobomimicReplayImageDataset(BaseImageDataset):
 
         # action
         stat = array_to_stats(self.replay_buffer['action'])
-        if self.abs_action:
+        if self.action_preprocess == 'pos_quat':
+            range_indices = list(self.action_pos_indices) + list(self.action_range_indices)
+            this_normalizer = get_mixed_normalizer_from_stat(
+                stat,
+                range_indices=range_indices)
+        elif self.abs_action:
             if stat['mean'].shape[-1] > 10:
                 # dual arm
                 this_normalizer = robomimic_abs_action_only_dual_arm_normalizer_from_stat(stat)
@@ -287,6 +343,12 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         current_abs_idx = min(current_abs_idx, episode_end)
 
         action_history = self.replay_buffer['action'][episode_start:current_abs_idx].astype(np.float32)
+        action_history = _apply_binary_action_quantization(
+            action_history,
+            self.binary_action_indices,
+            self.binary_action_low,
+            self.binary_action_high,
+            self.binary_action_threshold)
         action_history_length = action_history.shape[0]
 
         padded_history = np.zeros(
@@ -326,8 +388,31 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         return persistent_action_value.astype(np.float32)
 
 
-def _convert_actions(raw_actions, abs_action, rotation_transformer):
-    actions = raw_actions
+def _normalize_quaternion_components(actions, quat_indices):
+    if len(quat_indices) == 0:
+        return actions
+    actions = actions.copy()
+    quat = actions[..., quat_indices]
+    quat_norm = np.linalg.norm(quat, axis=-1, keepdims=True)
+    quat_norm = np.maximum(quat_norm, 1e-8)
+    actions[..., quat_indices] = quat / quat_norm
+    return actions
+
+
+def _convert_actions(
+        raw_actions,
+        abs_action,
+        rotation_transformer,
+        action_preprocess='auto',
+        action_quat_indices=None,
+        normalize_action_quaternion=False):
+    actions = raw_actions.astype(np.float32)
+    if action_preprocess == 'pos_quat':
+        if normalize_action_quaternion:
+            actions = _normalize_quaternion_components(
+                actions, action_quat_indices or [])
+        return actions
+
     if abs_action:
         is_dual_arm = False
         if raw_actions.shape[-1] == 14:
@@ -346,6 +431,21 @@ def _convert_actions(raw_actions, abs_action, rotation_transformer):
         if is_dual_arm:
             raw_actions = raw_actions.reshape(-1,20)
         actions = raw_actions
+    return actions
+
+
+def _apply_binary_action_quantization(
+        actions,
+        binary_action_indices,
+        low_value,
+        high_value,
+        threshold):
+    if len(binary_action_indices) == 0:
+        return actions
+    actions = actions.copy()
+    selected = actions[..., binary_action_indices]
+    quantized = np.where(selected >= threshold, high_value, low_value).astype(actions.dtype)
+    actions[..., binary_action_indices] = quantized
     return actions
 
 
@@ -369,6 +469,15 @@ def _resolve_action_indices(indices, action_dim):
 
 
 def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, rotation_transformer,
+        action_preprocess='auto',
+        action_pos_indices=None,
+        action_quat_indices=None,
+        action_range_indices=None,
+        normalize_action_quaternion=False,
+        binary_action_indices=None,
+        binary_action_low=-1.0,
+        binary_action_high=1.0,
+        binary_action_threshold=0.0,
         use_initial_image_obs_only=False, n_workers=None, max_inflight_tasks=None):
     if n_workers is None:
         n_workers = multiprocessing.cpu_count()
@@ -380,6 +489,11 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
     lowdim_keys = list()
     # construct compressors and chunks
     obs_shape_meta = shape_meta['obs']
+    action_dim = int(shape_meta['action']['shape'][0])
+    action_pos_indices = _resolve_action_indices(action_pos_indices, action_dim)
+    action_quat_indices = _resolve_action_indices(action_quat_indices, action_dim)
+    action_range_indices = _resolve_action_indices(action_range_indices, action_dim)
+    binary_action_indices = _resolve_action_indices(binary_action_indices, action_dim)
     for key, attr in obs_shape_meta.items():
         shape = attr['shape']
         type = attr.get('type', 'low_dim')
@@ -422,8 +536,17 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
                 this_data = _convert_actions(
                     raw_actions=this_data,
                     abs_action=abs_action,
-                    rotation_transformer=rotation_transformer
+                    rotation_transformer=rotation_transformer,
+                    action_preprocess=action_preprocess,
+                    action_quat_indices=action_quat_indices,
+                    normalize_action_quaternion=normalize_action_quaternion,
                 )
+                this_data = _apply_binary_action_quantization(
+                    this_data,
+                    binary_action_indices,
+                    binary_action_low,
+                    binary_action_high,
+                    binary_action_threshold)
                 assert this_data.shape == (n_steps,) + tuple(shape_meta['action']['shape'])
             else:
                 assert this_data.shape == (n_steps,) + tuple(shape_meta['obs'][key]['shape'])

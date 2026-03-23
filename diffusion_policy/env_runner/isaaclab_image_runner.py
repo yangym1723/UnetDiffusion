@@ -82,6 +82,11 @@ class IsaacLabImageRunner(BaseImageRunner):
         depth_data_type: str = "distance_to_camera",
         use_initial_image_obs_only: bool = False,
         observe_before_act_steps: int = 0,
+        binary_action_indices=None,
+        binary_action_low: float = -1.0,
+        binary_action_high: float = 1.0,
+        binary_action_threshold: float = 0.0,
+        quaternion_action_indices=None,
     ):
         super().__init__(output_dir)
 
@@ -135,6 +140,13 @@ class IsaacLabImageRunner(BaseImageRunner):
         action_shape = shape_meta["action"]["shape"]
         assert len(action_shape) == 1
         self.action_dim = int(action_shape[0])
+        self.binary_action_indices = self._resolve_action_indices(
+            binary_action_indices, self.action_dim)
+        self.binary_action_low = float(binary_action_low)
+        self.binary_action_high = float(binary_action_high)
+        self.binary_action_threshold = float(binary_action_threshold)
+        self.quaternion_action_indices = self._resolve_action_indices(
+            quaternion_action_indices, self.action_dim)
 
         camera_depth_meta = shape_meta["obs"].get("camera_depth")
         if camera_depth_meta is not None:
@@ -158,6 +170,23 @@ class IsaacLabImageRunner(BaseImageRunner):
     def _as_bool(value) -> bool:
         arr = np.asarray(IsaacLabImageRunner._to_numpy(value))
         return bool(np.any(arr))
+
+    @staticmethod
+    def _resolve_action_indices(indices, action_dim):
+        if indices is None:
+            return []
+        resolved = []
+        for idx in indices:
+            idx = int(idx)
+            if idx < 0:
+                idx += action_dim
+            if idx < 0 or idx >= action_dim:
+                raise IndexError(
+                    f'action index {idx} is out of bounds for action_dim={action_dim}')
+            resolved.append(idx)
+        if len(set(resolved)) != len(resolved):
+            raise ValueError(f'duplicate action indices are not allowed: {resolved}')
+        return resolved
 
     @staticmethod
     def _resolve_repo_root() -> pathlib.Path:
@@ -423,6 +452,27 @@ class IsaacLabImageRunner(BaseImageRunner):
             result[key] = value.copy()
         return result
 
+    def _apply_binary_action_quantization(self, action: np.ndarray) -> np.ndarray:
+        if len(self.binary_action_indices) == 0:
+            return action
+        action = action.copy()
+        selected = action[..., self.binary_action_indices]
+        action[..., self.binary_action_indices] = np.where(
+            selected >= self.binary_action_threshold,
+            self.binary_action_high,
+            self.binary_action_low).astype(action.dtype)
+        return action
+
+    def _normalize_quaternion_action(self, action: np.ndarray) -> np.ndarray:
+        if len(self.quaternion_action_indices) == 0:
+            return action
+        action = action.copy()
+        quat = action[..., self.quaternion_action_indices]
+        quat_norm = np.linalg.norm(quat, axis=-1, keepdims=True)
+        quat_norm = np.maximum(quat_norm, 1e-8)
+        action[..., self.quaternion_action_indices] = quat / quat_norm
+        return action
+
     @staticmethod
     def _frame_from_obs(obs: dict, render_obs_key: str) -> Optional[np.ndarray]:
         if render_obs_key not in obs:
@@ -557,6 +607,8 @@ class IsaacLabImageRunner(BaseImageRunner):
                     action_chunk_step = 0
 
                 current_action = action_chunk[:, action_chunk_step, :]
+                current_action = self._normalize_quaternion_action(current_action)
+                current_action = self._apply_binary_action_quantization(current_action)
                 action_tensor = torch.from_numpy(current_action).to(
                     device=env.unwrapped.device,
                     dtype=torch.float32,
