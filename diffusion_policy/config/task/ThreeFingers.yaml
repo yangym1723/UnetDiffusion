@@ -3,9 +3,9 @@ name: ThreeFingers
 shape_meta: &shape_meta
   # acceptable types: rgb, low_dim
   obs:
-    camera_rgb:
-      shape: [3, 240, 320]
-      type: rgb
+    # camera_rgb:
+    #   shape: [3, 240, 320]
+    #   type: rgb
     camera_depth:
       shape: [3, 240, 320]
       type: rgb
