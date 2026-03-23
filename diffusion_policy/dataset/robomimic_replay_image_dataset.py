@@ -41,6 +41,16 @@ def _build_rotation_transformer_if_needed(abs_action, rotation_rep, action_prepr
     return RotationTransformer(
         from_rep='axis_angle', to_rep=rotation_rep)
 
+
+def _to_builtin_config(value):
+    if OmegaConf.is_config(value):
+        value = OmegaConf.to_container(value, resolve=True)
+    if isinstance(value, dict):
+        return {k: _to_builtin_config(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_builtin_config(v) for v in value]
+    return value
+
 class RobomimicReplayImageDataset(BaseImageDataset):
     def __init__(self,
             shape_meta: dict,
@@ -81,7 +91,7 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             action_preprocess=action_preprocess)
 
         replay_buffer = None
-        cache_config = {
+        cache_config = _to_builtin_config({
             'shape_meta': OmegaConf.to_container(shape_meta, resolve=True)
                 if OmegaConf.is_config(shape_meta) else copy.deepcopy(shape_meta),
             'abs_action': abs_action,
@@ -100,7 +110,7 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             'binary_action_high': binary_action_high,
             'binary_action_threshold': binary_action_threshold,
             'use_initial_image_obs_only': use_initial_image_obs_only,
-        }
+        })
         cache_hash = hashlib.sha1(
             json.dumps(cache_config, sort_keys=True).encode('utf-8')
         ).hexdigest()[:10]
