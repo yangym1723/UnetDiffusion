@@ -273,6 +273,7 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         self._persistent_action_count = None
         self._persistent_action_value = None
         self._persistent_action_frozen = None
+        self._persistent_action_batch_fallback_warned = False
 
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
@@ -427,11 +428,45 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             return None
         if 'persistent_action_value' not in batch:
             if self.persistent_action_use_dataset_anchor_in_training:
-                raise RuntimeError(
-                    'Missing `persistent_action_value` in batch. '
-                    'Enable task.dataset.return_persistent_action_value in the config.')
+                if not self._persistent_action_batch_fallback_warned:
+                    print(
+                        "Warning: `persistent_action_value` is missing in the batch. "
+                        "Falling back to computing the anchor from batch actions."
+                    )
+                    self._persistent_action_batch_fallback_warned = True
+                return self._infer_persistent_action_value_from_batch(batch)
             return None
         return batch['persistent_action_value'].to(device=self.device, dtype=self.dtype)
+
+    def _infer_persistent_action_value_from_batch(
+            self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        if 'action' not in batch:
+            raise RuntimeError(
+                'Missing `action` in batch. Cannot infer persistent action anchor.')
+
+        action = batch['action'].to(device=self.device, dtype=self.dtype)
+        if action.ndim != 3:
+            raise RuntimeError(
+                f'Expected `action` to have shape (B, T, Da), got {tuple(action.shape)}')
+
+        if len(self.persistent_action_indices) == 0:
+            raise RuntimeError(
+                'persistent_action_indices is empty while persistent action is enabled.')
+
+        window = action.shape[1]
+        if self.persistent_action_warmup_steps > 0:
+            window = min(window, self.persistent_action_warmup_steps)
+        window = max(window, 1)
+
+        selected = action[:, :window, self.persistent_action_indices]
+        if self.persistent_action_estimate_mode == 'mean':
+            persistent_action_value = selected.mean(dim=1)
+        elif self.persistent_action_estimate_mode == 'last':
+            persistent_action_value = selected[:, -1]
+        else:
+            raise ValueError(
+                f'Unsupported persistent_action estimate_mode: {self.persistent_action_estimate_mode}')
+        return persistent_action_value
 
     def _apply_persistent_action_anchor(self,
             action_tensor: torch.Tensor,
