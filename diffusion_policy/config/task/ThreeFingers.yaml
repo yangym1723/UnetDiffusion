@@ -1,14 +1,14 @@
 name: ThreeFingers
 
 shape_meta: &shape_meta
-  # acceptable types: rgb, low_dim
+  # acceptable types: rgb, depth, low_dim
   obs:
-    # camera_rgb:
-    #   shape: [3, 240, 320]
-    #   type: rgb
-    camera_depth:
+    camera_rgb:
       shape: [3, 240, 320]
       type: rgb
+    camera_depth:
+      shape: [1, 240, 320]
+      type: depth
     contact_force_z:
       shape: [3]
       type: low_dim
@@ -85,6 +85,9 @@ dataset:
   binary_action_low: -1.0
   binary_action_high: 1.0
   binary_action_threshold: 0.0
+  depth_min: ${task.env_runner.depth_min}
+  depth_max: ${task.env_runner.depth_max}
+  depth_invert: ${task.env_runner.depth_invert}
   use_initial_image_obs_only: True
   use_cache: True
   seed: 42

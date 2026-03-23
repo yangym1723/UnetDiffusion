@@ -53,7 +53,7 @@ def _to_builtin_config(value):
     return value
 
 
-def _resize_hwc_image(image: np.ndarray, target_shape) -> np.ndarray:
+def _resize_hwc_image(image: np.ndarray, target_shape, interpolation=None) -> np.ndarray:
     target_c, target_h, target_w = tuple(target_shape)
     if image.ndim == 2:
         image = image[..., None]
@@ -76,9 +76,10 @@ def _resize_hwc_image(image: np.ndarray, target_shape) -> np.ndarray:
     if (source_h, source_w, source_c) == (target_h, target_w, target_c):
         return image
 
-    interpolation = cv2.INTER_AREA
-    if target_h > source_h or target_w > source_w:
-        interpolation = cv2.INTER_LINEAR
+    if interpolation is None:
+        interpolation = cv2.INTER_AREA
+        if target_h > source_h or target_w > source_w:
+            interpolation = cv2.INTER_LINEAR
     resized = cv2.resize(image, (target_w, target_h), interpolation=interpolation)
     if resized.ndim == 2:
         resized = resized[..., None]
@@ -90,6 +91,39 @@ def _resize_hwc_image(image: np.ndarray, target_shape) -> np.ndarray:
                 f'Unexpected channel count after resize: got {resized.shape[-1]}, '
                 f'expected {target_c}.')
     return resized.astype(image.dtype, copy=False)
+
+
+def _prepare_depth_frame(
+        frame: np.ndarray,
+        target_shape,
+        depth_min=None,
+        depth_max=None,
+        depth_invert=False) -> np.ndarray:
+    frame = _resize_hwc_image(
+        np.asarray(frame),
+        target_shape,
+        interpolation=cv2.INTER_NEAREST)
+
+    depth = frame.astype(np.float32, copy=False)
+    if np.issubdtype(frame.dtype, np.integer):
+        depth = depth / 255.0
+    else:
+        if depth_min is not None and depth_max is not None:
+            if depth_max <= depth_min:
+                raise RuntimeError(
+                    f'depth_max ({depth_max}) must be greater than depth_min ({depth_min}).')
+            depth = np.clip(depth, depth_min, depth_max)
+            depth = (depth - depth_min) / (depth_max - depth_min)
+            if depth_invert:
+                depth = 1.0 - depth
+        else:
+            if np.min(depth) < 0.0 or np.max(depth) > 1.0:
+                raise RuntimeError(
+                    'Depth frames are not in [0,1]. Set dataset.depth_min and '
+                    'dataset.depth_max so they can be normalized consistently.')
+
+    depth = np.clip(depth, 0.0, 1.0).astype(np.float32, copy=False)
+    return depth
 
 class RobomimicReplayImageDataset(BaseImageDataset):
     def __init__(self,
@@ -116,6 +150,9 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             binary_action_low=-1.0,
             binary_action_high=1.0,
             binary_action_threshold=0.0,
+            depth_min=None,
+            depth_max=None,
+            depth_invert=False,
             use_initial_image_obs_only=False,
             use_cache=False,
             seed=42,
@@ -134,7 +171,7 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         cache_config = _to_builtin_config({
             'shape_meta': OmegaConf.to_container(shape_meta, resolve=True)
                 if OmegaConf.is_config(shape_meta) else copy.deepcopy(shape_meta),
-            'cache_storage_version': 3,
+            'cache_storage_version': 4,
             'abs_action': abs_action,
             'rotation_rep': rotation_rep,
             'action_preprocess': action_preprocess,
@@ -150,6 +187,9 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             'binary_action_low': binary_action_low,
             'binary_action_high': binary_action_high,
             'binary_action_threshold': binary_action_threshold,
+            'depth_min': depth_min,
+            'depth_max': depth_max,
+            'depth_invert': depth_invert,
             'use_initial_image_obs_only': use_initial_image_obs_only,
         })
         cache_hash = hashlib.sha1(
@@ -180,6 +220,9 @@ class RobomimicReplayImageDataset(BaseImageDataset):
                             binary_action_low=binary_action_low,
                             binary_action_high=binary_action_high,
                             binary_action_threshold=binary_action_threshold,
+                            depth_min=depth_min,
+                            depth_max=depth_max,
+                            depth_invert=depth_invert,
                             use_initial_image_obs_only=use_initial_image_obs_only)
                         print('Saving cache to disk.')
                         with zarr.ZipStore(cache_zarr_path) as zip_store:
@@ -211,15 +254,21 @@ class RobomimicReplayImageDataset(BaseImageDataset):
                 binary_action_low=binary_action_low,
                 binary_action_high=binary_action_high,
                 binary_action_threshold=binary_action_threshold,
+                depth_min=depth_min,
+                depth_max=depth_max,
+                depth_invert=depth_invert,
                 use_initial_image_obs_only=use_initial_image_obs_only)
 
         rgb_keys = list()
+        depth_keys = list()
         lowdim_keys = list()
         obs_shape_meta = shape_meta['obs']
         for key, attr in obs_shape_meta.items():
             type = attr.get('type', 'low_dim')
             if type == 'rgb':
                 rgb_keys.append(key)
+            elif type == 'depth':
+                depth_keys.append(key)
             elif type == 'low_dim':
                 lowdim_keys.append(key)
         
@@ -229,7 +278,7 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         key_first_k = dict()
         if n_obs_steps is not None:
             # only take first k obs from images
-            for key in rgb_keys + lowdim_keys:
+            for key in rgb_keys + depth_keys + lowdim_keys:
                 key_first_k[key] = n_obs_steps
 
         val_mask = get_val_mask(
@@ -250,6 +299,7 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         self.shape_meta = shape_meta
         self.obs_shape_meta = obs_shape_meta
         self.rgb_keys = rgb_keys
+        self.depth_keys = depth_keys
         self.lowdim_keys = lowdim_keys
         self.abs_action = abs_action
         self.n_obs_steps = n_obs_steps
@@ -276,6 +326,9 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         self.binary_action_low = float(binary_action_low)
         self.binary_action_high = float(binary_action_high)
         self.binary_action_threshold = float(binary_action_threshold)
+        self.depth_min = depth_min
+        self.depth_max = depth_max
+        self.depth_invert = bool(depth_invert)
         self.episode_ends = replay_buffer.episode_ends[:].astype(np.int64)
         self.episode_starts = np.concatenate([
             np.zeros((1,), dtype=np.int64),
@@ -290,7 +343,7 @@ class RobomimicReplayImageDataset(BaseImageDataset):
                     "ReplayBuffer cache is missing `meta/initial_images`. "
                     "Delete the old cache and rebuild it with the current code.")
             initial_image_group = meta_group['initial_images']
-            for key in self.rgb_keys:
+            for key in self.rgb_keys + self.depth_keys:
                 if key not in initial_image_group:
                     raise RuntimeError(
                         f"ReplayBuffer cache is missing initial image data for `{key}`.")
@@ -359,6 +412,8 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         # image
         for key in self.rgb_keys:
             normalizer[key] = get_image_range_normalizer()
+        for key in self.depth_keys:
+            normalizer[key] = get_image_range_normalizer()
         return normalizer
 
     def get_all_actions(self) -> torch.Tensor:
@@ -386,6 +441,10 @@ class RobomimicReplayImageDataset(BaseImageDataset):
                 initial_frame = np.asarray(self.initial_image_arrays[key][episode_idx])
                 tiled = np.repeat(initial_frame[None, ...], image_steps, axis=0)
                 obs_dict[key] = np.moveaxis(tiled, -1, 1).astype(np.float32) / 255.
+            for key in self.depth_keys:
+                initial_frame = np.asarray(self.initial_image_arrays[key][episode_idx])
+                tiled = np.repeat(initial_frame[None, ...], image_steps, axis=0)
+                obs_dict[key] = np.moveaxis(tiled, -1, 1).astype(np.float32)
         else:
             for key in self.rgb_keys:
                 # move channel last to channel first
@@ -394,6 +453,9 @@ class RobomimicReplayImageDataset(BaseImageDataset):
                 obs_dict[key] = np.moveaxis(data[key][T_slice],-1,1
                     ).astype(np.float32) / 255.
                 # T,C,H,W
+                del data[key]
+            for key in self.depth_keys:
+                obs_dict[key] = np.moveaxis(data[key][T_slice], -1, 1).astype(np.float32)
                 del data[key]
         for key in self.lowdim_keys:
             obs_dict[key] = data[key][T_slice].astype(np.float32)
@@ -566,6 +628,9 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
         binary_action_low=-1.0,
         binary_action_high=1.0,
         binary_action_threshold=0.0,
+        depth_min=None,
+        depth_max=None,
+        depth_invert=False,
         use_initial_image_obs_only=False, n_workers=None, max_inflight_tasks=None):
     if n_workers is None:
         n_workers = multiprocessing.cpu_count()
@@ -574,6 +639,7 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
 
     # parse shape_meta
     rgb_keys = list()
+    depth_keys = list()
     lowdim_keys = list()
     # construct compressors and chunks
     obs_shape_meta = shape_meta['obs']
@@ -587,6 +653,8 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
         type = attr.get('type', 'low_dim')
         if type == 'rgb':
             rgb_keys.append(key)
+        elif type == 'depth':
+            depth_keys.append(key)
         elif type == 'low_dim':
             lowdim_keys.append(key)
     
@@ -657,8 +725,8 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
                 return False
 
         image_progress_total = (
-            len(demos) * len(rgb_keys) if use_initial_image_obs_only
-            else n_steps * len(rgb_keys)
+            len(demos) * (len(rgb_keys) + len(depth_keys)) if use_initial_image_obs_only
+            else n_steps * (len(rgb_keys) + len(depth_keys))
         )
         with tqdm(total=image_progress_total, desc="Loading image data", mininterval=1.0) as pbar:
             # one chunk per thread, therefore no synchronization needed
@@ -699,6 +767,43 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
                                 img_arr,
                                 episode_idx,
                                 initial_image))
+                    for key in depth_keys:
+                        shape = tuple(shape_meta['obs'][key]['shape'])
+                        c, h, w = shape
+                        depth_arr = initial_image_group.require_dataset(
+                            name=key,
+                            shape=(len(demos), h, w, c),
+                            chunks=(1, h, w, c),
+                            compressor=None,
+                            dtype=np.float32
+                        )
+                        for episode_idx in range(len(demos)):
+                            demo = demos[f'demo_{episode_idx}']
+                            hdf5_arr = demo['obs'][key]
+                            if hdf5_arr.shape[0] == 0:
+                                raise RuntimeError(
+                                    f'Image key `{key}` in demo_{episode_idx} has zero frames.')
+                            initial_depth = _prepare_depth_frame(
+                                hdf5_arr[0],
+                                shape,
+                                depth_min=depth_min,
+                                depth_max=depth_max,
+                                depth_invert=depth_invert)
+
+                            if len(futures) >= max_inflight_tasks:
+                                completed, futures = concurrent.futures.wait(
+                                    futures,
+                                    return_when=concurrent.futures.FIRST_COMPLETED)
+                                for f in completed:
+                                    if not f.result():
+                                        raise RuntimeError('Failed to encode image!')
+                                pbar.update(len(completed))
+
+                            futures.add(executor.submit(
+                                img_copy,
+                                depth_arr,
+                                episode_idx,
+                                initial_depth))
                 else:
                     for key in rgb_keys:
                         data_key = 'obs/' + key
@@ -744,6 +849,55 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
                                 futures.add(
                                     executor.submit(img_copy, 
                                         img_arr, zarr_idx, image))
+                    for key in depth_keys:
+                        shape = tuple(shape_meta['obs'][key]['shape'])
+                        c, h, w = shape
+                        depth_arr = data_group.require_dataset(
+                            name=key,
+                            shape=(n_steps, h, w, c),
+                            chunks=(1, h, w, c),
+                            compressor=None,
+                            dtype=np.float32
+                        )
+                        for episode_idx in range(len(demos)):
+                            demo = demos[f'demo_{episode_idx}']
+                            hdf5_arr = demo['obs'][key]
+                            episode_length = int(demo['actions'].shape[0])
+                            if hdf5_arr.shape[0] == 0:
+                                raise RuntimeError(
+                                    f'Image key `{key}` in demo_{episode_idx} has zero frames.')
+
+                            if hdf5_arr.shape[0] != episode_length:
+                                raise RuntimeError(
+                                    f'Image key `{key}` in demo_{episode_idx} has '
+                                    f'{hdf5_arr.shape[0]} frames, but actions has '
+                                    f'{episode_length} steps. Set '
+                                    f'`task.dataset.use_initial_image_obs_only=True` '
+                                    f'to broadcast the first frame across the episode.')
+                            image_sequence = [
+                                _prepare_depth_frame(
+                                    hdf5_arr[hdf5_idx],
+                                    shape,
+                                    depth_min=depth_min,
+                                    depth_max=depth_max,
+                                    depth_invert=depth_invert)
+                                for hdf5_idx in range(hdf5_arr.shape[0])
+                            ]
+
+                            for hdf5_idx, image in enumerate(image_sequence):
+                                if len(futures) >= max_inflight_tasks:
+                                    completed, futures = concurrent.futures.wait(
+                                        futures,
+                                        return_when=concurrent.futures.FIRST_COMPLETED)
+                                    for f in completed:
+                                        if not f.result():
+                                            raise RuntimeError('Failed to encode image!')
+                                    pbar.update(len(completed))
+
+                                zarr_idx = episode_starts[episode_idx] + hdf5_idx
+                                futures.add(
+                                    executor.submit(img_copy,
+                                        depth_arr, zarr_idx, image))
 
                 completed, futures = concurrent.futures.wait(futures)
                 for f in completed:

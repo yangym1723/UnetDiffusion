@@ -66,6 +66,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             type = attr.get('type', 'low_dim')
             if type == 'rgb':
                 obs_config['rgb'].append(key)
+            elif type == 'depth':
+                obs_config['rgb'].append(key)
             elif type == 'low_dim':
                 obs_config['low_dim'].append(key)
             else:

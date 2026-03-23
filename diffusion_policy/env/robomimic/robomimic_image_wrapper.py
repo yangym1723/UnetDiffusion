@@ -27,7 +27,7 @@ class RobomimicImageWrapper(gym.Env):
             high = np.broadcast_to(np.asarray(value['max'], dtype=np.float32), shape).copy()
             return low, high
 
-        if obs_type == 'rgb':
+        if obs_type in {'rgb', 'depth'}:
             low = np.zeros(shape, dtype=np.float32)
             high = np.ones(shape, dtype=np.float32)
             return low, high

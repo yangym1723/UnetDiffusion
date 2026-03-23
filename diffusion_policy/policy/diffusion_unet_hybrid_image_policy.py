@@ -111,6 +111,9 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             this_type = attr.get('type', 'low_dim')
             if this_type == 'rgb':
                 obs_config['rgb'].append(key)
+            elif this_type == 'depth':
+                # Use the image encoder path with a single input channel.
+                obs_config['rgb'].append(key)
             elif this_type == 'low_dim':
                 obs_config['low_dim'].append(key)
             else:

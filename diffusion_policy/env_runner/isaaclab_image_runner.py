@@ -132,6 +132,10 @@ class IsaacLabImageRunner(BaseImageRunner):
             key for key, attr in shape_meta["obs"].items()
             if attr.get("type", "low_dim") == "rgb"
         ]
+        self.depth_keys = [
+            key for key, attr in shape_meta["obs"].items()
+            if attr.get("type", "low_dim") == "depth"
+        ]
         self.lowdim_keys = [
             key for key, attr in shape_meta["obs"].items()
             if attr.get("type", "low_dim") == "low_dim"
@@ -265,15 +269,19 @@ class IsaacLabImageRunner(BaseImageRunner):
         self._isaaclab_initialized = True
 
     @staticmethod
-    def _resize_image_chw(image_chw: np.ndarray, target_shape: tuple[int, int, int]) -> np.ndarray:
+    def _resize_image_chw(
+            image_chw: np.ndarray,
+            target_shape: tuple[int, int, int],
+            interpolation=None) -> np.ndarray:
         c, target_h, target_w = target_shape
         if image_chw.shape == target_shape:
             return image_chw
 
         image_hwc = np.transpose(image_chw, (1, 2, 0))
-        interpolation = cv2.INTER_AREA
-        if target_h > image_hwc.shape[0] or target_w > image_hwc.shape[1]:
-            interpolation = cv2.INTER_LINEAR
+        if interpolation is None:
+            interpolation = cv2.INTER_AREA
+            if target_h > image_hwc.shape[0] or target_w > image_hwc.shape[1]:
+                interpolation = cv2.INTER_LINEAR
         resized_hwc = cv2.resize(image_hwc, (target_w, target_h), interpolation=interpolation)
         if resized_hwc.ndim == 2:
             resized_hwc = resized_hwc[..., None]
@@ -299,19 +307,9 @@ class IsaacLabImageRunner(BaseImageRunner):
             )
         return array
 
-    def _encode_depth_as_rgb(self, depth_raw: np.ndarray) -> np.ndarray:
+    def _prepare_depth_chw(self, depth_raw: np.ndarray) -> np.ndarray:
         if self.depth_target_shape is None:
             raise RuntimeError("camera_depth is not present in shape_meta.")
-
-        if self.depth_min is None or self.depth_max is None:
-            raise RuntimeError(
-                "Depth conversion requires fixed `depth_min` and `depth_max` in the env_runner config "
-                "to match the dataset preprocessing."
-            )
-        if self.depth_max <= self.depth_min:
-            raise RuntimeError(
-                f"depth_max ({self.depth_max}) must be greater than depth_min ({self.depth_min})."
-            )
 
         depth_raw = self._to_numpy(depth_raw).astype(np.float32)
         if depth_raw.ndim == 3:
@@ -319,19 +317,23 @@ class IsaacLabImageRunner(BaseImageRunner):
         if depth_raw.shape[-1] != 1:
             raise RuntimeError(f"Expected depth image with one channel, got shape {depth_raw.shape}")
 
-        depth = np.clip(depth_raw[..., 0], self.depth_min, self.depth_max)
-        depth = (depth - self.depth_min) / (self.depth_max - self.depth_min)
-        if self.depth_invert:
-            depth = 1.0 - depth
-        depth = np.clip(depth, 0.0, 1.0)
-        depth = depth[..., None]
-
-        target_c = self.depth_target_shape[0]
-        if target_c > 1:
-            depth = np.repeat(depth, target_c, axis=-1)
+        depth = depth_raw[..., 0]
+        if self.depth_min is not None and self.depth_max is not None:
+            if self.depth_max <= self.depth_min:
+                raise RuntimeError(
+                    f"depth_max ({self.depth_max}) must be greater than depth_min ({self.depth_min})."
+                )
+            depth = np.clip(depth, self.depth_min, self.depth_max)
+            depth = (depth - self.depth_min) / (self.depth_max - self.depth_min)
+            if self.depth_invert:
+                depth = 1.0 - depth
+        depth = np.clip(depth, 0.0, 1.0)[..., None]
 
         depth_chw = np.transpose(depth, (2, 0, 1)).astype(np.float32)
-        depth_chw = self._resize_image_chw(depth_chw, self.depth_target_shape)
+        depth_chw = self._resize_image_chw(
+            depth_chw,
+            self.depth_target_shape,
+            interpolation=cv2.INTER_NEAREST)
         return depth_chw
 
     def _extract_camera_output(self, isaac_obs: dict, env, key: str):
@@ -402,7 +404,7 @@ class IsaacLabImageRunner(BaseImageRunner):
             ).astype(np.float32)
             result["camera_rgb"] = rgb_out
 
-        if "camera_depth" in self.rgb_keys:
+        if "camera_depth" in self.depth_keys:
             depth_raw = self._extract_camera_output(isaac_obs, env, self.depth_data_type)
             if depth_raw is None:
                 raise RuntimeError("Failed to extract depth camera observations from IsaacLab.")
@@ -416,7 +418,7 @@ class IsaacLabImageRunner(BaseImageRunner):
                     f"Expected depth image batch with 3 or 4 dims, got shape {depth_np.shape}"
                 )
             depth_out = np.stack(
-                [self._encode_depth_as_rgb(depth_np[idx]) for idx in range(depth_np.shape[0])],
+                [self._prepare_depth_chw(depth_np[idx]) for idx in range(depth_np.shape[0])],
                 axis=0,
             ).astype(np.float32)
             result["camera_depth"] = depth_out
@@ -552,7 +554,7 @@ class IsaacLabImageRunner(BaseImageRunner):
             if self.use_initial_image_obs_only:
                 frozen_image_obs = {
                     key: obs[key].copy()
-                    for key in self.rgb_keys
+                    for key in (self.rgb_keys + self.depth_keys)
                     if key in obs
                 }
                 obs = self._freeze_image_obs(obs, frozen_image_obs)

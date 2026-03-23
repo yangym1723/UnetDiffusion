@@ -39,6 +39,8 @@ class RobomimicImagePolicy(BaseImagePolicy):
             type = attr.get('type', 'low_dim')
             if type == 'rgb':
                 obs_config['rgb'].append(key)
+            elif type == 'depth':
+                obs_config['rgb'].append(key)
             elif type == 'low_dim':
                 obs_config['low_dim'].append(key)
             else:
@@ -139,4 +141,3 @@ def test():
     shape_meta = cfg.shape_meta
 
     policy = RobomimicImagePolicy(shape_meta=shape_meta)
-
