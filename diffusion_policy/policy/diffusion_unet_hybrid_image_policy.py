@@ -494,6 +494,26 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             action_tensor,
             self.quaternion_action_indices)
 
+    def _normalize_persistent_action_value(
+            self, persistent_action_value: torch.Tensor) -> torch.Tensor:
+        if persistent_action_value.ndim != 2:
+            raise RuntimeError(
+                f'Expected persistent_action_value to have shape (B, Dp), got '
+                f'{tuple(persistent_action_value.shape)}')
+        if persistent_action_value.shape[-1] != len(self.persistent_action_indices):
+            raise RuntimeError(
+                'persistent_action_value has incompatible dimension. '
+                f'Expected {len(self.persistent_action_indices)}, got '
+                f'{persistent_action_value.shape[-1]}')
+
+        full_action = torch.zeros(
+            (persistent_action_value.shape[0], self.action_dim),
+            device=persistent_action_value.device,
+            dtype=persistent_action_value.dtype)
+        full_action[..., self.persistent_action_indices] = persistent_action_value
+        normalized_full_action = self.normalizer['action'].normalize(full_action)
+        return normalized_full_action[..., self.persistent_action_indices]
+
     def _apply_online_persistent_action(
             self,
             action_chunk: torch.Tensor,
@@ -725,7 +745,7 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         history_feature = self._encode_action_history_from_batch(batch)
         persistent_action_value = self._get_persistent_action_value_from_batch(batch)
         if persistent_action_value is not None and self.persistent_action_use_dataset_anchor_in_training:
-            normalized_persistent_action_value = self.normalizer['action'].normalize(
+            normalized_persistent_action_value = self._normalize_persistent_action_value(
                 persistent_action_value)
             nactions = nactions.clone()
             nactions[..., self.persistent_action_indices] = (
