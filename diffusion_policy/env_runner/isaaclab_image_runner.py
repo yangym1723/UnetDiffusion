@@ -271,7 +271,10 @@ class IsaacLabImageRunner(BaseImageRunner):
             return image_chw
 
         image_hwc = np.transpose(image_chw, (1, 2, 0))
-        resized_hwc = cv2.resize(image_hwc, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        interpolation = cv2.INTER_AREA
+        if target_h > image_hwc.shape[0] or target_w > image_hwc.shape[1]:
+            interpolation = cv2.INTER_LINEAR
+        resized_hwc = cv2.resize(image_hwc, (target_w, target_h), interpolation=interpolation)
         if resized_hwc.ndim == 2:
             resized_hwc = resized_hwc[..., None]
         resized_chw = np.transpose(resized_hwc, (2, 0, 1))

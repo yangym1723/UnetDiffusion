@@ -50,7 +50,7 @@ policy:
   n_obs_steps: ${n_obs_steps}
   num_inference_steps: 100
   obs_as_global_cond: ${obs_as_global_cond}
-  crop_shape: [408, 544]
+  crop_shape: [216, 288]
   # crop_shape: null
   diffusion_step_embed_dim: 128
   down_dims: [256, 512, 1024]

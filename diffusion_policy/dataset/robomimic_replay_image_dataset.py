@@ -9,6 +9,7 @@ import shutil
 import copy
 import json
 import hashlib
+import cv2
 from filelock import FileLock
 from threadpoolctl import threadpool_limits
 import concurrent.futures
@@ -50,6 +51,45 @@ def _to_builtin_config(value):
     if isinstance(value, (list, tuple)):
         return [_to_builtin_config(v) for v in value]
     return value
+
+
+def _resize_hwc_image(image: np.ndarray, target_shape) -> np.ndarray:
+    target_c, target_h, target_w = tuple(target_shape)
+    if image.ndim == 2:
+        image = image[..., None]
+    if image.ndim != 3:
+        raise RuntimeError(f'Expected image with shape (H, W, C), got {image.shape}')
+
+    source_h, source_w, source_c = image.shape
+    if source_c != target_c:
+        if source_c == 1 and target_c > 1:
+            image = np.repeat(image, target_c, axis=-1)
+            source_c = target_c
+        elif target_c == 1 and source_c > 1:
+            image = image[..., :1]
+            source_c = 1
+        else:
+            raise RuntimeError(
+                f'Cannot resize image with {source_c} channels to target '
+                f'channel count {target_c}.')
+
+    if (source_h, source_w, source_c) == (target_h, target_w, target_c):
+        return image
+
+    interpolation = cv2.INTER_AREA
+    if target_h > source_h or target_w > source_w:
+        interpolation = cv2.INTER_LINEAR
+    resized = cv2.resize(image, (target_w, target_h), interpolation=interpolation)
+    if resized.ndim == 2:
+        resized = resized[..., None]
+    if resized.shape[-1] != target_c:
+        if resized.shape[-1] == 1 and target_c > 1:
+            resized = np.repeat(resized, target_c, axis=-1)
+        else:
+            raise RuntimeError(
+                f'Unexpected channel count after resize: got {resized.shape[-1]}, '
+                f'expected {target_c}.')
+    return resized.astype(image.dtype, copy=False)
 
 class RobomimicReplayImageDataset(BaseImageDataset):
     def __init__(self,
@@ -94,7 +134,7 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         cache_config = _to_builtin_config({
             'shape_meta': OmegaConf.to_container(shape_meta, resolve=True)
                 if OmegaConf.is_config(shape_meta) else copy.deepcopy(shape_meta),
-            'cache_storage_version': 2,
+            'cache_storage_version': 3,
             'abs_action': abs_action,
             'rotation_rep': rotation_rep,
             'action_preprocess': action_preprocess,
@@ -643,6 +683,7 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
                             if hdf5_arr.shape[0] == 0:
                                 raise RuntimeError(
                                     f'Image key `{key}` in demo_{episode_idx} has zero frames.')
+                            initial_image = _resize_hwc_image(hdf5_arr[0], shape)
 
                             if len(futures) >= max_inflight_tasks:
                                 completed, futures = concurrent.futures.wait(
@@ -657,7 +698,7 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
                                 img_copy,
                                 img_arr,
                                 episode_idx,
-                                hdf5_arr[0]))
+                                initial_image))
                 else:
                     for key in rgb_keys:
                         data_key = 'obs/' + key
@@ -689,6 +730,7 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
                             image_sequence = [hdf5_arr[hdf5_idx] for hdf5_idx in range(hdf5_arr.shape[0])]
 
                             for hdf5_idx, image in enumerate(image_sequence):
+                                image = _resize_hwc_image(image, shape)
                                 if len(futures) >= max_inflight_tasks:
                                     # limit number of inflight tasks
                                     completed, futures = concurrent.futures.wait(futures, 
