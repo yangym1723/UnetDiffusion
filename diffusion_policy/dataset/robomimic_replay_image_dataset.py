@@ -94,6 +94,7 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         cache_config = _to_builtin_config({
             'shape_meta': OmegaConf.to_container(shape_meta, resolve=True)
                 if OmegaConf.is_config(shape_meta) else copy.deepcopy(shape_meta),
+            'cache_storage_version': 2,
             'abs_action': abs_action,
             'rotation_rep': rotation_rep,
             'action_preprocess': action_preprocess,
@@ -241,6 +242,19 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             self.episode_ends[:-1]
         ])
         self.max_episode_length = int(np.max(self.episode_ends - self.episode_starts))
+        self.initial_image_arrays = {}
+        if self.use_initial_image_obs_only:
+            meta_group = self.replay_buffer.meta
+            if 'initial_images' not in meta_group:
+                raise RuntimeError(
+                    "ReplayBuffer cache is missing `meta/initial_images`. "
+                    "Delete the old cache and rebuild it with the current code.")
+            initial_image_group = meta_group['initial_images']
+            for key in self.rgb_keys:
+                if key not in initial_image_group:
+                    raise RuntimeError(
+                        f"ReplayBuffer cache is missing initial image data for `{key}`.")
+                self.initial_image_arrays[key] = initial_image_group[key]
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
@@ -324,14 +338,23 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         T_slice = slice(self.n_obs_steps)
 
         obs_dict = dict()
-        for key in self.rgb_keys:
-            # move channel last to channel first
-            # T,H,W,C
-            # convert uint8 image to float32
-            obs_dict[key] = np.moveaxis(data[key][T_slice],-1,1
-                ).astype(np.float32) / 255.
-            # T,C,H,W
-            del data[key]
+        if self.use_initial_image_obs_only:
+            buffer_start_idx, _, _, _ = self.sampler.indices[idx]
+            episode_idx = np.searchsorted(self.episode_ends, buffer_start_idx, side='right')
+            image_steps = self.n_obs_steps if self.n_obs_steps is not None else self.horizon
+            for key in self.rgb_keys:
+                initial_frame = np.asarray(self.initial_image_arrays[key][episode_idx])
+                tiled = np.repeat(initial_frame[None, ...], image_steps, axis=0)
+                obs_dict[key] = np.moveaxis(tiled, -1, 1).astype(np.float32) / 255.
+        else:
+            for key in self.rgb_keys:
+                # move channel last to channel first
+                # T,H,W,C
+                # convert uint8 image to float32
+                obs_dict[key] = np.moveaxis(data[key][T_slice],-1,1
+                    ).astype(np.float32) / 255.
+                # T,C,H,W
+                del data[key]
         for key in self.lowdim_keys:
             obs_dict[key] = data[key][T_slice].astype(np.float32)
             del data[key]
@@ -592,34 +615,70 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
                 return True
             except Exception as e:
                 return False
-        
-        with tqdm(total=n_steps*len(rgb_keys), desc="Loading image data", mininterval=1.0) as pbar:
+
+        image_progress_total = (
+            len(demos) * len(rgb_keys) if use_initial_image_obs_only
+            else n_steps * len(rgb_keys)
+        )
+        with tqdm(total=image_progress_total, desc="Loading image data", mininterval=1.0) as pbar:
             # one chunk per thread, therefore no synchronization needed
             with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
                 futures = set()
-                for key in rgb_keys:
-                    data_key = 'obs/' + key
-                    shape = tuple(shape_meta['obs'][key]['shape'])
-                    c,h,w = shape
-                    this_compressor = Jpeg2k(level=50)
-                    img_arr = data_group.require_dataset(
-                        name=key,
-                        shape=(n_steps,h,w,c),
-                        chunks=(1,h,w,c),
-                        compressor=this_compressor,
-                        dtype=np.uint8
-                    )
-                    for episode_idx in range(len(demos)):
-                        demo = demos[f'demo_{episode_idx}']
-                        hdf5_arr = demo['obs'][key]
-                        episode_length = int(demo['actions'].shape[0])
-                        if hdf5_arr.shape[0] == 0:
-                            raise RuntimeError(
-                                f'Image key `{key}` in demo_{episode_idx} has zero frames.')
+                if use_initial_image_obs_only:
+                    initial_image_group = meta_group.require_group('initial_images', overwrite=True)
+                    for key in rgb_keys:
+                        shape = tuple(shape_meta['obs'][key]['shape'])
+                        c, h, w = shape
+                        this_compressor = Jpeg2k(level=50)
+                        img_arr = initial_image_group.require_dataset(
+                            name=key,
+                            shape=(len(demos), h, w, c),
+                            chunks=(1, h, w, c),
+                            compressor=this_compressor,
+                            dtype=np.uint8
+                        )
+                        for episode_idx in range(len(demos)):
+                            demo = demos[f'demo_{episode_idx}']
+                            hdf5_arr = demo['obs'][key]
+                            if hdf5_arr.shape[0] == 0:
+                                raise RuntimeError(
+                                    f'Image key `{key}` in demo_{episode_idx} has zero frames.')
 
-                        if use_initial_image_obs_only:
-                            image_sequence = [hdf5_arr[0]] * episode_length
-                        else:
+                            if len(futures) >= max_inflight_tasks:
+                                completed, futures = concurrent.futures.wait(
+                                    futures,
+                                    return_when=concurrent.futures.FIRST_COMPLETED)
+                                for f in completed:
+                                    if not f.result():
+                                        raise RuntimeError('Failed to encode image!')
+                                pbar.update(len(completed))
+
+                            futures.add(executor.submit(
+                                img_copy,
+                                img_arr,
+                                episode_idx,
+                                hdf5_arr[0]))
+                else:
+                    for key in rgb_keys:
+                        data_key = 'obs/' + key
+                        shape = tuple(shape_meta['obs'][key]['shape'])
+                        c,h,w = shape
+                        this_compressor = Jpeg2k(level=50)
+                        img_arr = data_group.require_dataset(
+                            name=key,
+                            shape=(n_steps,h,w,c),
+                            chunks=(1,h,w,c),
+                            compressor=this_compressor,
+                            dtype=np.uint8
+                        )
+                        for episode_idx in range(len(demos)):
+                            demo = demos[f'demo_{episode_idx}']
+                            hdf5_arr = demo['obs'][key]
+                            episode_length = int(demo['actions'].shape[0])
+                            if hdf5_arr.shape[0] == 0:
+                                raise RuntimeError(
+                                    f'Image key `{key}` in demo_{episode_idx} has zero frames.')
+
                             if hdf5_arr.shape[0] != episode_length:
                                 raise RuntimeError(
                                     f'Image key `{key}` in demo_{episode_idx} has '
@@ -629,20 +688,21 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
                                     f'to broadcast the first frame across the episode.')
                             image_sequence = [hdf5_arr[hdf5_idx] for hdf5_idx in range(hdf5_arr.shape[0])]
 
-                        for hdf5_idx, image in enumerate(image_sequence):
-                            if len(futures) >= max_inflight_tasks:
-                                # limit number of inflight tasks
-                                completed, futures = concurrent.futures.wait(futures, 
-                                    return_when=concurrent.futures.FIRST_COMPLETED)
-                                for f in completed:
-                                    if not f.result():
-                                        raise RuntimeError('Failed to encode image!')
-                                pbar.update(len(completed))
+                            for hdf5_idx, image in enumerate(image_sequence):
+                                if len(futures) >= max_inflight_tasks:
+                                    # limit number of inflight tasks
+                                    completed, futures = concurrent.futures.wait(futures, 
+                                        return_when=concurrent.futures.FIRST_COMPLETED)
+                                    for f in completed:
+                                        if not f.result():
+                                            raise RuntimeError('Failed to encode image!')
+                                    pbar.update(len(completed))
 
-                            zarr_idx = episode_starts[episode_idx] + hdf5_idx
-                            futures.add(
-                                executor.submit(img_copy, 
-                                    img_arr, zarr_idx, image))
+                                zarr_idx = episode_starts[episode_idx] + hdf5_idx
+                                futures.add(
+                                    executor.submit(img_copy, 
+                                        img_arr, zarr_idx, image))
+
                 completed, futures = concurrent.futures.wait(futures)
                 for f in completed:
                     if not f.result():
