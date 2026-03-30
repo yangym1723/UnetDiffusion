@@ -2,6 +2,7 @@ from typing import Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
+from torch.nn.utils.rnn import pack_padded_sequence
 
 
 RNNState = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -97,27 +98,41 @@ class ActionHistoryRNN(nn.Module):
                 (batch_size, self.output_dim),
                 device=action_history.device,
                 dtype=action_history.dtype)
-
-        rnn_input = action_history
-        if self.use_cumulative_sum:
-            rnn_input = torch.cumsum(action_history, dim=1)
-
-        initial_state = self.get_zero_state(
-            batch_size=batch_size,
+        feature = torch.zeros(
+            (batch_size, self.output_dim),
             device=action_history.device,
             dtype=action_history.dtype)
-        output, _ = self.rnn(rnn_input, initial_state)
+        valid_mask = lengths > 0
+        if not valid_mask.any():
+            return feature
 
-        gather_idx = lengths.clamp_min(1) - 1
-        gather_idx = gather_idx.to(device=output.device, dtype=torch.long)
-        batch_idx = torch.arange(batch_size, device=output.device)
-        last_output = output[batch_idx, gather_idx]
-        feature = self._project(last_output)
+        valid_history = action_history[valid_mask]
+        valid_lengths = lengths[valid_mask].to(dtype=torch.long)
+        max_valid_length = int(valid_lengths.max().item())
+        valid_history = valid_history[:, :max_valid_length]
 
-        zero_length_mask = lengths == 0
-        if zero_length_mask.any():
-            feature = feature.clone()
-            feature[zero_length_mask] = 0
+        rnn_input = valid_history
+        if self.use_cumulative_sum:
+            rnn_input = torch.cumsum(valid_history, dim=1)
+
+        packed_input = pack_padded_sequence(
+            rnn_input,
+            lengths=valid_lengths.detach().cpu(),
+            batch_first=True,
+            enforce_sorted=False)
+        initial_state = self.get_zero_state(
+            batch_size=valid_history.shape[0],
+            device=action_history.device,
+            dtype=action_history.dtype)
+        _, final_state = self.rnn(packed_input, initial_state)
+        if self.is_lstm:
+            last_hidden = final_state[0][-1]
+        else:
+            last_hidden = final_state[-1]
+        projected = self._project(last_hidden)
+        if projected.dtype != feature.dtype:
+            projected = projected.to(feature.dtype)
+        feature[valid_mask] = projected
         return feature
 
     def step(self, cumulative_action: torch.Tensor, prev_state: Optional[RNNState]) -> Tuple[torch.Tensor, RNNState]:

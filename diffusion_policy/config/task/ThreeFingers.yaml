@@ -3,9 +3,9 @@ name: ThreeFingers
 shape_meta: &shape_meta
   # acceptable types: rgb, depth, low_dim
   obs:
-    # camera_rgb:
-    #   shape: [3, 240, 320]
-    #   type: rgb
+    camera_rgb:
+      shape: [3, 240, 320]
+      type: rgb
     camera_depth:
       shape: [1, 240, 320]
       type: depth
@@ -21,7 +21,7 @@ shape_meta: &shape_meta
   action: 
     shape: [10]
 
-dataset_path: &dataset_path data/dataset_H480W640_process.hdf5
+dataset_path: &dataset_path data/dataset_H480W640_128.hdf5
 abs_action: &abs_action False
 
 env_runner:

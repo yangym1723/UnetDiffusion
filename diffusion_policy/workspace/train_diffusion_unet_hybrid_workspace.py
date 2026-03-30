@@ -8,6 +8,7 @@ if __name__ == "__main__":
     os.chdir(ROOT_DIR)
 
 import os
+import contextlib
 import hydra
 import torch
 from omegaconf import OmegaConf
@@ -32,7 +33,7 @@ from diffusion_policy.model.common.lr_scheduler import get_scheduler
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
-    include_keys = ['global_step', 'epoch']
+    include_keys = ['global_step', 'epoch', 'optimizer_step']
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
         super().__init__(cfg, output_dir=output_dir)
@@ -57,9 +58,15 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
         # configure training state
         self.global_step = 0
         self.epoch = 0
+        self.optimizer_step = 0
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
+        rollout_every = cfg.training.get('rollout_every', None)
+        if rollout_every is not None:
+            rollout_every = int(rollout_every)
+            if rollout_every <= 0:
+                rollout_every = None
 
         # resume training
         if cfg.training.resume:
@@ -84,16 +91,20 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
             self.ema_model.set_normalizer(normalizer)
 
         # configure lr scheduler
+        max_optimizer_steps = cfg.training.get('max_optimizer_steps', None)
+        num_training_steps = (
+            len(train_dataloader) * cfg.training.num_epochs
+        ) // cfg.training.gradient_accumulate_every
+        if max_optimizer_steps is not None:
+            num_training_steps = int(max_optimizer_steps)
         lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
             num_warmup_steps=cfg.training.lr_warmup_steps,
-            num_training_steps=(
-                len(train_dataloader) * cfg.training.num_epochs) \
-                    // cfg.training.gradient_accumulate_every,
+            num_training_steps=num_training_steps,
             # pytorch assumes stepping LRScheduler every epoch
             # however huggingface diffusers steps it every batch
-            last_epoch=self.global_step-1
+            last_epoch=self.optimizer_step-1
         )
 
         # configure ema
@@ -104,11 +115,12 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                 model=self.ema_model)
 
         # configure env
-        env_runner: BaseImageRunner
-        env_runner = hydra.utils.instantiate(
-            cfg.task.env_runner,
-            output_dir=self.output_dir)
-        assert isinstance(env_runner, BaseImageRunner)
+        env_runner: BaseImageRunner = None
+        if rollout_every is not None:
+            env_runner = hydra.utils.instantiate(
+                cfg.task.env_runner,
+                output_dir=self.output_dir)
+            assert isinstance(env_runner, BaseImageRunner)
 
         # configure logging
         wandb_run = wandb.init(
@@ -135,6 +147,34 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
             self.ema_model.to(device)
         optimizer_to(self.optimizer, device)
 
+        if device.type == 'cuda':
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            if hasattr(torch, 'set_float32_matmul_precision'):
+                torch.set_float32_matmul_precision('high')
+
+        mixed_precision_cfg = cfg.training.get('mixed_precision', {})
+        mixed_precision_enabled = bool(mixed_precision_cfg.get('enabled', False))
+        mixed_precision_dtype = str(mixed_precision_cfg.get('dtype', 'bf16')).lower()
+        autocast_dtype = None
+        if mixed_precision_enabled:
+            if device.type != 'cuda':
+                print('Warning: mixed precision is enabled but CUDA is unavailable; disabling autocast.')
+                mixed_precision_enabled = False
+            elif mixed_precision_dtype in {'bf16', 'bfloat16'}:
+                autocast_dtype = torch.bfloat16
+            elif mixed_precision_dtype in {'fp16', 'float16', 'half'}:
+                autocast_dtype = torch.float16
+            else:
+                raise ValueError(f'Unsupported mixed precision dtype: {mixed_precision_dtype}')
+        grad_scaler = torch.cuda.amp.GradScaler(
+            enabled=mixed_precision_enabled and autocast_dtype == torch.float16)
+
+        def autocast_context():
+            if not mixed_precision_enabled:
+                return contextlib.nullcontext()
+            return torch.autocast(device_type=device.type, dtype=autocast_dtype)
+
         # save batch for sampling
         train_sampling_batch = None
 
@@ -150,6 +190,8 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
         with JsonLogger(log_path) as json_logger:
+            stop_training = False
+            warned_missing_topk_metric = False
             for local_epoch_idx in range(cfg.training.num_epochs):
                 step_log = dict()
                 # ========= train for this epoch ==========
@@ -163,15 +205,29 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                             train_sampling_batch = batch
 
                         # compute loss
-                        raw_loss = self.model.compute_loss(batch)
+                        with autocast_context():
+                            raw_loss = self.model.compute_loss(batch)
                         loss = raw_loss / cfg.training.gradient_accumulate_every
-                        loss.backward()
+                        if grad_scaler.is_enabled():
+                            grad_scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
 
                         # step optimizer
-                        if self.global_step % cfg.training.gradient_accumulate_every == 0:
-                            self.optimizer.step()
-                            self.optimizer.zero_grad()
+                        is_last_dataloader_batch = (batch_idx == (len(train_dataloader)-1))
+                        should_step = (
+                            ((batch_idx + 1) % cfg.training.gradient_accumulate_every) == 0
+                            or is_last_dataloader_batch
+                        )
+                        if should_step:
+                            if grad_scaler.is_enabled():
+                                grad_scaler.step(self.optimizer)
+                                grad_scaler.update()
+                            else:
+                                self.optimizer.step()
+                            self.optimizer.zero_grad(set_to_none=True)
                             lr_scheduler.step()
+                            self.optimizer_step += 1
                         
                         # update ema
                         if cfg.training.use_ema:
@@ -188,7 +244,11 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                             'lr': lr_scheduler.get_last_lr()[0]
                         }
 
-                        is_last_batch = (batch_idx == (len(train_dataloader)-1))
+                        reached_max_optimizer_steps = (
+                            max_optimizer_steps is not None
+                            and self.optimizer_step >= int(max_optimizer_steps)
+                        )
+                        is_last_batch = is_last_dataloader_batch or reached_max_optimizer_steps
                         if not is_last_batch:
                             # log of last step is combined with validation and rollout
                             wandb_run.log(step_log, step=self.global_step)
@@ -197,6 +257,9 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
 
                         if (cfg.training.max_train_steps is not None) \
                             and batch_idx >= (cfg.training.max_train_steps-1):
+                            break
+                        if reached_max_optimizer_steps:
+                            stop_training = True
                             break
 
                 # at the end of each epoch
@@ -211,7 +274,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                 policy.eval()
 
                 # run rollout
-                if (self.epoch % cfg.training.rollout_every) == 0:
+                if rollout_every is not None and (self.epoch % rollout_every) == 0:
                     runner_log = env_runner.run(policy)
                     # log all
                     step_log.update(runner_log)
@@ -271,7 +334,16 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                     # We can't copy the last checkpoint here
                     # since save_checkpoint uses threads.
                     # therefore at this point the file might have been empty!
-                    topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+                    topk_monitor_key = str(cfg.checkpoint.topk.monitor_key).replace('/', '_')
+                    topk_ckpt_path = None
+                    if topk_monitor_key in metric_dict:
+                        topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+                    elif not warned_missing_topk_metric:
+                        print(
+                            f"Warning: top-k checkpoint monitor key `{cfg.checkpoint.topk.monitor_key}` "
+                            "is missing from the current logs. Skipping top-k checkpoint update."
+                        )
+                        warned_missing_topk_metric = True
 
                     if topk_ckpt_path is not None:
                         self.save_checkpoint(path=topk_ckpt_path)
@@ -284,6 +356,8 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                 json_logger.log(step_log)
                 self.global_step += 1
                 self.epoch += 1
+                if stop_training:
+                    break
 
 @hydra.main(
     version_base=None,

@@ -307,17 +307,32 @@ class IsaacLabImageRunner(BaseImageRunner):
             )
         return array
 
+    @staticmethod
+    def _ensure_batched_depth_hwc(array: np.ndarray) -> np.ndarray:
+        if array.ndim == 2:
+            array = array[None, ..., None]
+        elif array.ndim == 3:
+            if array.shape[-1] == 1:
+                array = array[None, ...]
+            else:
+                array = array[..., None]
+        if array.ndim != 4:
+            raise RuntimeError(f"Expected depth image batch with 4 dims, got shape {array.shape}")
+        if array.shape[-1] != 1:
+            raise RuntimeError(f"Expected depth image with one channel, got shape {array.shape}")
+        return array
+
     def _prepare_depth_chw(self, depth_raw: np.ndarray) -> np.ndarray:
         if self.depth_target_shape is None:
             raise RuntimeError("camera_depth is not present in shape_meta.")
 
         depth_raw = self._to_numpy(depth_raw).astype(np.float32)
-        if depth_raw.ndim == 3:
-            depth_raw = depth_raw[..., None]
-        if depth_raw.shape[-1] != 1:
+        if depth_raw.ndim == 2:
+            depth = depth_raw
+        elif depth_raw.ndim == 3 and depth_raw.shape[-1] == 1:
+            depth = depth_raw[..., 0]
+        else:
             raise RuntimeError(f"Expected depth image with one channel, got shape {depth_raw.shape}")
-
-        depth = depth_raw[..., 0]
         if self.depth_min is not None and self.depth_max is not None:
             if self.depth_max <= self.depth_min:
                 raise RuntimeError(
@@ -408,15 +423,7 @@ class IsaacLabImageRunner(BaseImageRunner):
             depth_raw = self._extract_camera_output(isaac_obs, env, self.depth_data_type)
             if depth_raw is None:
                 raise RuntimeError("Failed to extract depth camera observations from IsaacLab.")
-            depth_np = self._to_numpy(depth_raw)
-            if depth_np.ndim == 2:
-                depth_np = depth_np[None, ..., None]
-            elif depth_np.ndim == 3:
-                depth_np = depth_np[None, ...] if depth_np.shape[-1] == 1 else depth_np[..., None]
-            elif depth_np.ndim != 4:
-                raise RuntimeError(
-                    f"Expected depth image batch with 3 or 4 dims, got shape {depth_np.shape}"
-                )
+            depth_np = self._ensure_batched_depth_hwc(self._to_numpy(depth_raw))
             depth_out = np.stack(
                 [self._prepare_depth_chw(depth_np[idx]) for idx in range(depth_np.shape[0])],
                 axis=0,
