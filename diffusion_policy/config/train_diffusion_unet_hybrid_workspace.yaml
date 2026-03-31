@@ -28,7 +28,7 @@ task:
     persistent_action_indices: ${policy.persistent_action.indices}
     persistent_action_window: ${policy.persistent_action.warmup_steps}
     persistent_action_reduce: ${policy.persistent_action.estimate_mode}
-    model_rollout_refresh_every_epochs: 10
+    model_rollout_refresh_every_epochs: 1
     binary_action_indices: ${policy.binary_action.indices}
     binary_action_low: ${policy.binary_action.low_value}
     binary_action_high: ${policy.binary_action.high_value}
