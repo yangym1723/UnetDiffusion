@@ -24,7 +24,7 @@ task:
     action_history_source: model
     return_initial_obs: ${policy.persistent_action.enabled}
     return_persistent_action_value: ${policy.persistent_action.enabled}
-    persistent_action_source: dataset
+    persistent_action_source: model
     persistent_action_indices: ${policy.persistent_action.indices}
     persistent_action_window: ${policy.persistent_action.warmup_steps}
     persistent_action_reduce: ${policy.persistent_action.estimate_mode}
