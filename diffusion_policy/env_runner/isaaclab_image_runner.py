@@ -260,9 +260,10 @@ class IsaacLabImageRunner(BaseImageRunner):
         )
 
         control_hz = 60.0
+        total_required_steps = self.observe_before_act_steps + self.max_steps
         env_cfg.episode_length_s = max(
             float(env_cfg.episode_length_s),
-            self.max_steps / control_hz + 1.0,
+            total_required_steps / control_hz + 1.0,
         )
 
         self._env = gym.make(self.task_name, cfg=env_cfg)
@@ -464,6 +465,23 @@ class IsaacLabImageRunner(BaseImageRunner):
             result[key] = value.copy()
         return result
 
+    def _build_hold_action(self, obs: dict) -> np.ndarray:
+        value = next(iter(obs.values()))
+        batch_size = value.shape[0]
+        action = np.zeros((batch_size, self.action_dim), dtype=np.float32)
+
+        if 'ee_pose' in obs and self.action_dim >= 3:
+            action[:, :3] = obs['ee_pose']
+        if 'ee_quat' in obs and self.action_dim >= 7:
+            action[:, 3:7] = obs['ee_quat']
+
+        if len(self.binary_action_indices) > 0:
+            action[:, self.binary_action_indices] = self.binary_action_high
+
+        action = self._normalize_quaternion_action(action)
+        action = self._apply_binary_action_quantization(action)
+        return action
+
     def _apply_binary_action_quantization(self, action: np.ndarray) -> np.ndarray:
         if len(self.binary_action_indices) == 0:
             return action
@@ -596,6 +614,22 @@ class IsaacLabImageRunner(BaseImageRunner):
                 }
                 with torch.no_grad():
                     policy.observe_only(obs_dict)
+
+                hold_action = self._build_hold_action(obs)
+                hold_action_tensor = torch.from_numpy(hold_action).to(
+                    device=env.unwrapped.device,
+                    dtype=torch.float32,
+                )
+                step_result = env.step(hold_action_tensor)
+                if len(step_result) == 5:
+                    isaac_obs, _reward, terminated, truncated, _info = step_result
+                else:
+                    raise RuntimeError(
+                        f"Unexpected IsaacLab step return length during warmup: {len(step_result)}"
+                    )
+
+                obs = self._extract_obs(isaac_obs, env)
+                obs = self._freeze_image_obs(obs, frozen_image_obs)
                 obs_history.append(obs)
                 if len(obs_history) > self.n_obs_steps + 1:
                     obs_history.pop(0)
@@ -603,6 +637,7 @@ class IsaacLabImageRunner(BaseImageRunner):
                     frame = self._frame_from_obs(obs, self.render_obs_key)
                     if frame is not None:
                         video_frames.append(frame)
+                done = self._as_bool(terminated) or self._as_bool(truncated)
                 step_count += 1
                 pbar.update(1)
 

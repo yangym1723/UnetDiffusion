@@ -175,6 +175,15 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                 return contextlib.nullcontext()
             return torch.autocast(device_type=device.type, dtype=autocast_dtype)
 
+        def refresh_model_rollout_cache_if_needed(epoch: int):
+            if not hasattr(dataset, 'needs_model_rollout_refresh'):
+                return
+            if not dataset.needs_model_rollout_refresh(epoch):
+                return
+
+            print(f"Refreshing model rollout cache for epoch {epoch}")
+            dataset.refresh_model_rollout_cache(self.model, epoch=epoch)
+
         # save batch for sampling
         train_sampling_batch = None
 
@@ -193,6 +202,8 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
             stop_training = False
             warned_missing_topk_metric = False
             for local_epoch_idx in range(cfg.training.num_epochs):
+                refresh_model_rollout_cache_if_needed(self.epoch)
+                train_sampling_batch = None
                 step_log = dict()
                 # ========= train for this epoch ==========
                 train_losses = list()

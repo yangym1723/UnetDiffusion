@@ -21,10 +21,14 @@ obs_as_global_cond: True
 task:
   dataset:
     return_action_history: ${policy.action_history_rnn.enabled}
+    action_history_source: model
+    return_initial_obs: ${policy.persistent_action.enabled}
     return_persistent_action_value: ${policy.persistent_action.enabled}
+    persistent_action_source: dataset
     persistent_action_indices: ${policy.persistent_action.indices}
     persistent_action_window: ${policy.persistent_action.warmup_steps}
     persistent_action_reduce: ${policy.persistent_action.estimate_mode}
+    model_rollout_refresh_every_epochs: 10
     binary_action_indices: ${policy.binary_action.indices}
     binary_action_low: ${policy.binary_action.low_value}
     binary_action_high: ${policy.binary_action.high_value}
@@ -72,6 +76,9 @@ policy:
   persistent_action:
     enabled: True
     indices: [-3, -2]
+    source: initial_obs_estimator
+    estimator_hidden_dims: [256, 256]
+    loss_weight: 1.0
     warmup_steps: 50
     estimate_mode: mean
     freeze_after_warmup: True
@@ -102,14 +109,14 @@ dataloader:
   num_workers: 16
   shuffle: True
   pin_memory: True
-  persistent_workers: True
+  persistent_workers: False
 
 val_dataloader:
   batch_size: 64
   num_workers: 16
   shuffle: False
   pin_memory: True
-  persistent_workers: True
+  persistent_workers: False
 
 optimizer:
   _target_: torch.optim.AdamW

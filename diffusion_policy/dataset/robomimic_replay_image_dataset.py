@@ -1,4 +1,4 @@
-from typing import Dict, List
+from typing import Dict, List, Optional
 import torch
 import numpy as np
 import h5py
@@ -142,10 +142,14 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             normalize_action_quaternion=False,
             use_legacy_normalizer=False,
             return_action_history=False,
+            action_history_source='dataset',
+            return_initial_obs=False,
             return_persistent_action_value=False,
+            persistent_action_source='dataset',
             persistent_action_indices=None,
             persistent_action_window=0,
             persistent_action_reduce='mean',
+            model_rollout_refresh_every_epochs=1,
             binary_action_indices=None,
             binary_action_low=-1.0,
             binary_action_high=1.0,
@@ -309,7 +313,10 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         self.pad_after = pad_after
         self.use_legacy_normalizer = use_legacy_normalizer
         self.return_action_history = return_action_history
+        self.action_history_source = str(action_history_source).lower()
+        self.return_initial_obs = bool(return_initial_obs)
         self.return_persistent_action_value = return_persistent_action_value
+        self.persistent_action_source = str(persistent_action_source).lower()
         self.use_initial_image_obs_only = use_initial_image_obs_only
         self.action_dim = shape_meta['action']['shape'][0]
         self.action_preprocess = action_preprocess
@@ -321,6 +328,8 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             persistent_action_indices, self.action_dim)
         self.persistent_action_window = int(persistent_action_window)
         self.persistent_action_reduce = persistent_action_reduce
+        self.model_rollout_refresh_every_epochs = max(
+            int(model_rollout_refresh_every_epochs), 1)
         self.binary_action_indices = _resolve_action_indices(
             binary_action_indices, self.action_dim)
         self.binary_action_low = float(binary_action_low)
@@ -335,6 +344,17 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             self.episode_ends[:-1]
         ])
         self.max_episode_length = int(np.max(self.episode_ends - self.episode_starts))
+        if self.action_history_source not in {'dataset', 'model'}:
+            raise ValueError(
+                f'Unsupported action_history_source: {self.action_history_source}')
+        if self.persistent_action_source not in {'dataset', 'model'}:
+            raise ValueError(
+                f'Unsupported persistent_action_source: {self.persistent_action_source}')
+        self.model_rollout_cache = {
+            'ready': False,
+            'epoch': None,
+            'pred_actions': None,
+        }
         self.initial_image_arrays = {}
         if self.use_initial_image_obs_only:
             meta_group = self.replay_buffer.meta
@@ -360,6 +380,168 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             )
         val_set.train_mask = ~self.train_mask
         return val_set
+
+    def uses_model_rollout_cache(self) -> bool:
+        return (
+            self.action_history_source == 'model'
+            or self.persistent_action_source == 'model'
+        )
+
+    def needs_model_rollout_refresh(self, epoch: Optional[int] = None) -> bool:
+        if not self.uses_model_rollout_cache():
+            return False
+
+        cache = self.model_rollout_cache
+        if not cache['ready'] or cache['pred_actions'] is None:
+            return True
+
+        if epoch is None:
+            return False
+
+        cached_epoch = cache['epoch']
+        if cached_epoch is None:
+            return True
+        if int(epoch) == int(cached_epoch):
+            return False
+        return (int(epoch) % self.model_rollout_refresh_every_epochs) == 0
+
+    def _get_episode_step_obs(self, episode_idx: int, step_idx: int) -> Dict[str, np.ndarray]:
+        episode_start = int(self.episode_starts[episode_idx])
+        abs_idx = episode_start + int(step_idx)
+        obs = dict()
+
+        for key in self.rgb_keys:
+            if self.use_initial_image_obs_only:
+                frame = np.asarray(self.initial_image_arrays[key][episode_idx])
+            else:
+                frame = np.asarray(self.replay_buffer[key][abs_idx])
+            obs[key] = np.moveaxis(frame, -1, 0).astype(np.float32) / 255.0
+
+        for key in self.depth_keys:
+            if self.use_initial_image_obs_only:
+                frame = np.asarray(self.initial_image_arrays[key][episode_idx])
+            else:
+                frame = np.asarray(self.replay_buffer[key][abs_idx])
+            obs[key] = np.moveaxis(frame, -1, 0).astype(np.float32)
+
+        for key in self.lowdim_keys:
+            obs[key] = np.asarray(self.replay_buffer[key][abs_idx]).astype(np.float32)
+
+        return obs
+
+    def _get_episode_initial_obs(self, episode_idx: int) -> Dict[str, np.ndarray]:
+        episode_start = int(self.episode_starts[episode_idx])
+        obs = dict()
+
+        for key in self.rgb_keys:
+            if self.use_initial_image_obs_only:
+                frame = np.asarray(self.initial_image_arrays[key][episode_idx])
+            else:
+                frame = np.asarray(self.replay_buffer[key][episode_start])
+            obs[key] = np.moveaxis(frame[None, ...], -1, 1).astype(np.float32) / 255.0
+
+        for key in self.depth_keys:
+            if self.use_initial_image_obs_only:
+                frame = np.asarray(self.initial_image_arrays[key][episode_idx])
+            else:
+                frame = np.asarray(self.replay_buffer[key][episode_start])
+            obs[key] = np.moveaxis(frame[None, ...], -1, 1).astype(np.float32)
+
+        for key in self.lowdim_keys:
+            value = np.asarray(self.replay_buffer[key][episode_start]).astype(np.float32)
+            obs[key] = value[None, ...]
+
+        return obs
+
+    @staticmethod
+    def _stack_obs_history(obs_history: List[Dict[str, np.ndarray]], n_steps: int) -> Dict[str, np.ndarray]:
+        result = dict()
+        keys = obs_history[-1].keys()
+        for key in keys:
+            all_obs = [obs[key] for obs in obs_history]
+            n_available = len(all_obs)
+            obs_shape = all_obs[-1].shape
+            stacked = np.zeros((n_steps,) + obs_shape, dtype=all_obs[-1].dtype)
+            start_idx = max(0, n_steps - n_available)
+            src_start = max(0, n_available - n_steps)
+            for t_idx, src_idx in enumerate(range(src_start, n_available)):
+                stacked[start_idx + t_idx] = all_obs[src_idx]
+            if start_idx > 0:
+                stacked[:start_idx] = stacked[start_idx]
+            result[key] = stacked[None, ...]
+        return result
+
+    def refresh_model_rollout_cache(
+            self,
+            policy,
+            epoch: Optional[int] = None,
+            max_episodes: Optional[int] = None):
+        if not self.uses_model_rollout_cache():
+            return
+
+        n_obs_steps = self.n_obs_steps if self.n_obs_steps is not None else 1
+        warmup_steps = max(self.persistent_action_window, 0)
+        pred_actions = np.zeros(
+            (self.replay_buffer.n_steps, self.action_dim),
+            dtype=np.float32)
+
+        was_training = policy.training
+        policy.eval()
+        try:
+            with torch.no_grad():
+                episode_count = self.replay_buffer.n_episodes
+                if max_episodes is not None:
+                    episode_count = min(episode_count, int(max_episodes))
+                for episode_idx in tqdm(
+                        range(episode_count),
+                        desc='Refreshing model rollout cache',
+                        leave=False,
+                        mininterval=1.0):
+                    episode_start = int(self.episode_starts[episode_idx])
+                    episode_end = int(self.episode_ends[episode_idx])
+                    episode_length = episode_end - episode_start
+
+                    policy.reset()
+                    obs_history = list()
+                    action_chunk = None
+                    action_chunk_step = 0
+
+                    for step_idx in range(episode_length):
+                        obs = self._get_episode_step_obs(episode_idx, step_idx)
+                        obs_history.append(obs)
+                        if len(obs_history) > n_obs_steps:
+                            obs_history.pop(0)
+
+                        stacked_obs = self._stack_obs_history(obs_history, n_obs_steps)
+                        obs_dict = {
+                            key: torch.from_numpy(value).to(
+                                device=policy.device,
+                                dtype=policy.dtype)
+                            for key, value in stacked_obs.items()
+                        }
+
+                        if step_idx < warmup_steps:
+                            action_dict = policy.observe_only(obs_dict)
+                            current_action = action_dict['action'][0, 0]
+                        else:
+                            if action_chunk is None or action_chunk_step >= action_chunk.shape[0]:
+                                action_dict = policy.predict_action(obs_dict)
+                                action_chunk = action_dict['action'][0]
+                                action_chunk_step = 0
+                            current_action = action_chunk[action_chunk_step]
+                            action_chunk_step += 1
+
+                        pred_actions[episode_start + step_idx] = (
+                            current_action.detach().cpu().to(torch.float32).numpy()
+                        )
+        finally:
+            policy.reset()
+            if was_training:
+                policy.train()
+
+        self.model_rollout_cache['pred_actions'] = pred_actions
+        self.model_rollout_cache['epoch'] = None if epoch is None else int(epoch)
+        self.model_rollout_cache['ready'] = True
 
     def get_normalizer(self, **kwargs) -> LinearNormalizer:
         normalizer = LinearNormalizer()
@@ -425,6 +607,8 @@ class RobomimicReplayImageDataset(BaseImageDataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         threadpool_limits(1)
         data = self.sampler.sample_sequence(idx)
+        buffer_start_idx, _, _, _ = self.sampler.indices[idx]
+        episode_idx = np.searchsorted(self.episode_ends, buffer_start_idx, side='right')
 
         # to save RAM, only return first n_obs_steps of OBS
         # since the rest will be discarded anyway.
@@ -434,8 +618,6 @@ class RobomimicReplayImageDataset(BaseImageDataset):
 
         obs_dict = dict()
         if self.use_initial_image_obs_only:
-            buffer_start_idx, _, _, _ = self.sampler.indices[idx]
-            episode_idx = np.searchsorted(self.episode_ends, buffer_start_idx, side='right')
             image_steps = self.n_obs_steps if self.n_obs_steps is not None else self.horizon
             for key in self.rgb_keys:
                 initial_frame = np.asarray(self.initial_image_arrays[key][episode_idx])
@@ -465,13 +647,24 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             'obs': dict_apply(obs_dict, torch.from_numpy),
             'action': torch.from_numpy(data['action'].astype(np.float32))
         }
+        if self.return_initial_obs:
+            initial_obs_dict = self._get_episode_initial_obs(episode_idx)
+            torch_data['initial_obs'] = dict_apply(initial_obs_dict, torch.from_numpy)
         if self.return_action_history:
-            action_history, action_history_mask, action_history_length = self._get_action_history(idx)
+            if self.action_history_source == 'model':
+                action_history, action_history_mask, action_history_length = (
+                    self._get_model_action_history(idx))
+            else:
+                action_history, action_history_mask, action_history_length = (
+                    self._get_action_history(idx))
             torch_data['action_history'] = torch.from_numpy(action_history)
             torch_data['action_history_mask'] = torch.from_numpy(action_history_mask)
             torch_data['action_history_length'] = torch.tensor(action_history_length, dtype=torch.long)
         if self.return_persistent_action_value:
-            persistent_action_value = self._get_persistent_action_value(idx)
+            if self.persistent_action_source == 'model':
+                persistent_action_value = self._get_model_persistent_action_value(idx)
+            else:
+                persistent_action_value = self._get_persistent_action_value(idx)
             torch_data['persistent_action_value'] = torch.from_numpy(persistent_action_value)
         return torch_data
 
@@ -506,6 +699,37 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             history_mask[:action_history_length] = True
         return padded_history, history_mask, action_history_length
 
+    def _get_model_action_history(self, idx: int):
+        pred_actions = self.model_rollout_cache['pred_actions']
+        if pred_actions is None:
+            raise RuntimeError(
+                'Model rollout cache is not ready. Call `refresh_model_rollout_cache` '
+                'before requesting model-based action history.')
+
+        buffer_start_idx, _, sample_start_idx, _ = self.sampler.indices[idx]
+        episode_idx = np.searchsorted(self.episode_ends, buffer_start_idx, side='right')
+        episode_start = int(self.episode_starts[episode_idx])
+        episode_end = int(self.episode_ends[episode_idx])
+
+        current_obs_offset = 0
+        if self.n_obs_steps is not None:
+            current_obs_offset = self.n_obs_steps - 1 - sample_start_idx
+        current_abs_idx = buffer_start_idx + current_obs_offset
+        current_abs_idx = max(current_abs_idx, episode_start)
+        current_abs_idx = min(current_abs_idx, episode_end)
+
+        action_history = pred_actions[episode_start:current_abs_idx].astype(np.float32, copy=False)
+        action_history_length = action_history.shape[0]
+
+        padded_history = np.zeros(
+            (self.max_episode_length, self.action_dim),
+            dtype=np.float32)
+        history_mask = np.zeros((self.max_episode_length,), dtype=bool)
+        if action_history_length > 0:
+            padded_history[:action_history_length] = action_history
+            history_mask[:action_history_length] = True
+        return padded_history, history_mask, action_history_length
+
     def _get_persistent_action_value(self, idx: int):
         if len(self.persistent_action_indices) == 0:
             raise RuntimeError(
@@ -522,6 +746,39 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         action_window = self.replay_buffer['action'][episode_start:window_end].astype(np.float32)
         if action_window.shape[0] == 0:
             raise RuntimeError('persistent action window is empty.')
+
+        selected = action_window[:, self.persistent_action_indices]
+        if self.persistent_action_reduce == 'mean':
+            persistent_action_value = selected.mean(axis=0)
+        elif self.persistent_action_reduce == 'last':
+            persistent_action_value = selected[-1]
+        else:
+            raise ValueError(
+                f'Unsupported persistent_action_reduce: {self.persistent_action_reduce}')
+        return persistent_action_value.astype(np.float32)
+
+    def _get_model_persistent_action_value(self, idx: int):
+        pred_actions = self.model_rollout_cache['pred_actions']
+        if pred_actions is None:
+            raise RuntimeError(
+                'Model rollout cache is not ready. Call `refresh_model_rollout_cache` '
+                'before requesting model-based persistent action values.')
+
+        if len(self.persistent_action_indices) == 0:
+            raise RuntimeError(
+                'persistent_action_indices is empty while return_persistent_action_value=True.')
+
+        buffer_start_idx, _, _, _ = self.sampler.indices[idx]
+        episode_idx = np.searchsorted(self.episode_ends, buffer_start_idx, side='right')
+        episode_start = int(self.episode_starts[episode_idx])
+        episode_end = int(self.episode_ends[episode_idx])
+
+        window_end = episode_end
+        if self.persistent_action_window > 0:
+            window_end = min(episode_start + self.persistent_action_window, episode_end)
+        action_window = pred_actions[episode_start:window_end].astype(np.float32, copy=False)
+        if action_window.shape[0] == 0:
+            raise RuntimeError('model rollout persistent action window is empty.')
 
         selected = action_window[:, self.persistent_action_indices]
         if self.persistent_action_reduce == 'mean':
